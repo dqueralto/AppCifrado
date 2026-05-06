@@ -36,6 +36,9 @@ const CHUNK_SIZE: usize = 64 * 1024; // 64KB por bloque para optimizar RAM (Stre
 // Permite buscar el inicio del vault dentro de archivos multimedia (mkv, mp3, pdf).
 const STEGO_MARKER: &[u8] = b"CRYPTOBRO_HIDDEN_DATA_V1";
 
+// Firma del archivo (Magic Bytes) para validación estructural rápida.
+const MAGIC_BYTES: &[u8; 4] = b"CBRO";
+
 /// Borrado seguro de un archivo (DoD 5220.22-M: 3 pasadas)
 fn secure_shred(path: &str) -> std::io::Result<()> {
     let metadata = std::fs::metadata(path)?;
@@ -216,8 +219,8 @@ pub async fn encrypt_file(
     validate_path(&input_path)?;
     validate_path(&output_path)?;
 
-    let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
-    let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
+    let mut input_file = File::open(&input_path).map_err(|_| "Error al leer el archivo de origen. Comprueba los permisos o si existe.")?;
+    let mut output_file = File::create(&output_path).map_err(|_| "Error al crear el archivo de destino en la ruta especificada.")?;
 
     // Generar Sal y Nonces (Vectores de Inicialización) aleatorios
     let mut salt = [0u8; SALT_SIZE];
@@ -228,12 +231,13 @@ pub async fn encrypt_file(
     OsRng.fill_bytes(&mut aes_nonce_raw);
     OsRng.fill_bytes(&mut chacha_nonce_raw);
 
-    // Escribir cabecera: Flags (1) + Sal (16) + Nonce AES (12) + Nonce ChaCha (12)
+    // Escribir cabecera: Magic Bytes (4) + Flags (1) + Sal (16) + Nonce AES (12) + Nonce ChaCha (12)
+    output_file.write_all(MAGIC_BYTES).map_err(|_| "Fallo de I/O al escribir Magic Bytes")?;
     let flags = 0x01u8; // Bit 0: Compresión activada
-    output_file.write_all(&[flags]).map_err(|e| e.to_string())?;
-    output_file.write_all(&salt).map_err(|e| e.to_string())?;
-    output_file.write_all(&aes_nonce_raw).map_err(|e| e.to_string())?;
-    output_file.write_all(&chacha_nonce_raw).map_err(|e| e.to_string())?;
+    output_file.write_all(&[flags]).map_err(|_| "Fallo de I/O al escribir Flags")?;
+    output_file.write_all(&salt).map_err(|_| "Fallo de I/O al escribir Salt")?;
+    output_file.write_all(&aes_nonce_raw).map_err(|_| "Fallo de I/O al escribir Nonce AES")?;
+    output_file.write_all(&chacha_nonce_raw).map_err(|_| "Fallo de I/O al escribir Nonce ChaCha")?;
 
     // Derivar claves a partir de la contraseña
     let (aes_key, chacha_key) = derive_keys(&password, &salt);
@@ -264,21 +268,29 @@ pub async fn decrypt_file(
     validate_path(&input_path)?;
     validate_path(&output_path)?;
 
-    let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
-    let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
+    let mut input_file = File::open(&input_path).map_err(|_| "Error al leer el archivo. Comprueba los permisos o si existe.")?;
+    let mut output_file = File::create(&output_path).map_err(|_| "Error al crear el archivo de destino.")?;
+
+    // Leer Magic Bytes (Retrocompatibilidad con V0)
+    let mut magic_buf = [0u8; 4];
+    if input_file.read_exact(&mut magic_buf).is_ok() && &magic_buf != MAGIC_BYTES {
+        input_file.seek(SeekFrom::Start(0)).map_err(|_| "Error interno de lectura")?;
+    } else if &magic_buf != MAGIC_BYTES {
+        return Err("El archivo está corrupto o no se puede leer.".into());
+    }
 
     // Leer cabecera
     let mut flags_buf = [0u8; 1];
-    input_file.read_exact(&mut flags_buf).map_err(|e| e.to_string())?;
+    input_file.read_exact(&mut flags_buf).map_err(|_| "Archivo corrupto: No se pueden leer las banderas")?;
     let flags = flags_buf[0];
 
     let mut salt = [0u8; SALT_SIZE];
     let mut aes_nonce_raw = [0u8; NONCE_SIZE];
     let mut chacha_nonce_raw = [0u8; NONCE_SIZE];
 
-    input_file.read_exact(&mut salt).map_err(|e| e.to_string())?;
-    input_file.read_exact(&mut aes_nonce_raw).map_err(|e| e.to_string())?;
-    input_file.read_exact(&mut chacha_nonce_raw).map_err(|e| e.to_string())?;
+    input_file.read_exact(&mut salt).map_err(|_| "Archivo corrupto: Falta salt")?;
+    input_file.read_exact(&mut aes_nonce_raw).map_err(|_| "Archivo corrupto: Falta nonce AES")?;
+    input_file.read_exact(&mut chacha_nonce_raw).map_err(|_| "Archivo corrupto: Falta nonce ChaCha")?;
 
     // Re-derivar las mismas claves
     let (aes_key, chacha_key) = derive_keys(&password, &salt);
@@ -346,20 +358,21 @@ pub async fn encrypt_with_quantum(
     // Pero primero, necesitamos escribir el Ciphertext de ML-KEM en el archivo de salida
     // para que el destinatario pueda decapsularlo.
     
-    let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
-    let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
+    let mut input_file = File::open(&input_path).map_err(|_| "Error al leer archivo origen.")?;
+    let mut output_file = File::create(&output_path).map_err(|_| "Error al crear archivo destino.")?;
 
     // --- CONSTRUCCIÓN DEL CONTENEDOR .VAULT ---
+    output_file.write_all(MAGIC_BYTES).map_err(|_| "Error de I/O")?;
     
     // 1. Escribir Identificador (1 = Quantum, 2 = Quantum Signed)
     let vault_id = if signing_key_hex.is_some() { 2u8 } else { 1u8 };
-    output_file.write_all(&[vault_id]).map_err(|e| e.to_string())?;
+    output_file.write_all(&[vault_id]).map_err(|_| "Error de I/O")?;
 
     // Si es firmado, reservamos espacio para la firma (3309 bytes para ML-DSA-65)
     // Pero es mejor escribirla al final o después del ID.
     // Escribamos un marcador de posición si es ID 2.
     if vault_id == 2 {
-        output_file.write_all(&[0u8; 3309]).map_err(|e| e.to_string())?;
+        output_file.write_all(&[0u8; 3309]).map_err(|_| "Error de I/O")?;
     }
     
     // 2. Escribir el Ciphertext de ML-KEM (1568 bytes para ML-KEM-1024)
@@ -401,14 +414,14 @@ pub async fn encrypt_with_quantum(
             let vk_bytes = hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
             let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
 
-            // Calcular SHA-256 del cuerpo del archivo (desde byte 3310) mediante streaming
+            // Calcular SHA-256 del cuerpo del archivo (desde byte 3314) mediante streaming
             // Esto evita cargar archivos de varios GB en RAM para calcular la firma.
             let mut hasher = Sha256::new();
-            let mut sign_file = File::open(&output_path).map_err(|e| e.to_string())?;
-            sign_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
+            let mut sign_file = File::open(&output_path).map_err(|_| "Error al abrir archivo para firma")?;
+            sign_file.seek(SeekFrom::Start(3314)).map_err(|_| "Error I/O")?;
             let mut hash_buf = [0u8; 65536];
             loop {
-                let n = sign_file.read(&mut hash_buf).map_err(|e| e.to_string())?;
+                let n = sign_file.read(&mut hash_buf).map_err(|_| "Error de lectura")?;
                 if n == 0 { break; }
                 hasher.update(&hash_buf[..n]);
             }
@@ -422,9 +435,9 @@ pub async fn encrypt_with_quantum(
             let sig = dsa_kp.sign(file_hash.as_slice(), b"").map_err(|e| e.to_string())?;
 
             // Insertar la firma sin cargar todo el archivo en RAM
-            let mut f = std::fs::OpenOptions::new().write(true).open(&output_path).map_err(|e| e.to_string())?;
-            f.seek(SeekFrom::Start(1)).map_err(|e| e.to_string())?;
-            f.write_all(sig.as_bytes()).map_err(|e| e.to_string())?;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&output_path).map_err(|_| "Error al inyectar firma")?;
+            f.seek(SeekFrom::Start(5)).map_err(|_| "Error I/O")?;
+            f.write_all(sig.as_bytes()).map_err(|_| "Error escribiendo firma")?;
         }
     }
 
@@ -449,10 +462,19 @@ pub async fn decrypt_with_quantum(
     validate_path(&input_path)?;
     validate_path(&output_path)?;
 
-    let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
+    let mut input_file = File::open(&input_path).map_err(|_| "Error al abrir el archivo. Comprueba los permisos o si existe.")?;
     
     // --- PROTOCOLO DE DES-BLINDAJE CUÁNTICO ---
     
+    // Leer Magic Bytes (Retrocompatibilidad con V0)
+    let mut magic_buf = [0u8; 4];
+    let mut has_magic = false;
+    if input_file.read_exact(&mut magic_buf).is_ok() && &magic_buf == MAGIC_BYTES {
+        has_magic = true;
+    } else {
+        input_file.seek(SeekFrom::Start(0)).map_err(|_| "Error de I/O")?;
+    }
+
     // 1. Leer identificador de tipo de contenedor
     let mut id_buf = [0u8; 1];
     input_file.read_exact(&mut id_buf).map_err(|_| "Archivo no es un contenedor cuántico válido")?;
@@ -462,7 +484,7 @@ pub async fn decrypt_with_quantum(
     // Implementa el estándar FIPS 204 (ML-DSA-65).
     if vault_id == 2 {
         let mut sig = [0u8; 3309]; // Tamaño de firma ML-DSA-65
-        input_file.read_exact(&mut sig).map_err(|e| e.to_string())?;
+        input_file.read_exact(&mut sig).map_err(|_| "Fallo al leer firma digital")?;
 
         // Solo verificamos si el usuario ha proporcionado la llave pública del remitente.
         if let Some(vk_hex) = verifier_key_hex {
@@ -472,7 +494,7 @@ pub async fn decrypt_with_quantum(
             let mut hasher = Sha256::new();
             let mut hash_buf = [0u8; 65536];
             loop {
-                let n = input_file.read(&mut hash_buf).map_err(|e| e.to_string())?;
+                let n = input_file.read(&mut hash_buf).map_err(|_| "Fallo I/O")?;
                 if n == 0 { break; }
                 hasher.update(&hash_buf[..n]);
             }
@@ -487,21 +509,23 @@ pub async fn decrypt_with_quantum(
             }
             
             // Resetear cursor para continuar con el descifrado KEM
-            input_file = File::open(&input_path).map_err(|e| e.to_string())?;
-            input_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
+            let payload_offset = if has_magic { 3314 } else { 3310 };
+            input_file = File::open(&input_path).map_err(|_| "Fallo al reabrir archivo")?;
+            input_file.seek(SeekFrom::Start(payload_offset)).map_err(|_| "Fallo al mover cursor")?;
         } else {
             // Si no hay llave de verificación, saltamos el bloque de firma.
-            input_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
+            let payload_offset = if has_magic { 3314 } else { 3310 };
+            input_file.seek(SeekFrom::Start(payload_offset)).map_err(|_| "Fallo al mover cursor")?;
         }
     }
 
     // Leer Ciphertext de ML-KEM
     let mut kem_ciphertext = vec![0u8; 1568]; // Tamaño fijo para ML-KEM-1024
-    input_file.read_exact(&mut kem_ciphertext).map_err(|e| e.to_string())?;
+    input_file.read_exact(&mut kem_ciphertext).map_err(|_| "Error al leer cifrado KEM")?;
 
     // Leer Flags
     let mut flags_buf = [0u8; 1];
-    input_file.read_exact(&mut flags_buf).map_err(|e| e.to_string())?;
+    input_file.read_exact(&mut flags_buf).map_err(|_| "Error al leer banderas")?;
     let flags = flags_buf[0];
 
     // Decapsular usando la llave privada
