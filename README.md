@@ -82,7 +82,7 @@ CryptoBro está diseñado para manejar **archivos de varios gigabytes** sin cola
 
 ### A. Cifrado / Descifrado en Streaming (`crypto.rs`)
 En lugar de `fs::read` completo, se utiliza un bucle con `CHUNK_SIZE = 64KB`. Cada trozo se lee, se comprime, se cifra y se escribe al vuelo en disco.
-Para las firmas digitales, se emplea una inserción quirúrgica con `SeekFrom::Start(1)`, sobrescribiendo únicamente los `3309 bytes` correspondientes a la firma sin cargar el contenedor gigante en memoria.
+Para las firmas digitales, se emplea una inserción quirúrgica con `SeekFrom::Start(5)`, sobrescribiendo únicamente los `3309 bytes` correspondientes a la firma sin cargar el contenedor gigante en memoria. La posición `5` corresponde a los 4 bytes de Magic Bytes más el byte de Vault ID.
 
 ### B. Esteganografía Inteligente
 CryptoBro puede ocultar archivos `.vault` dentro de archivos multimedia normales (MKV, PDF, PNG) concatenándolos detrás del marcador `CRYPTOBRO_HIDDEN_DATA_V1`.
@@ -126,7 +126,7 @@ Aunque todo sucede en `App.tsx`, las vistas se renderizan condicionalmente media
 
 ## 🛠️ 9. Mantenimiento y Convenciones
 
-- **Tauri IPC**: Toda la comunicación con Rust ocurre a través de `invoke()`. Los comandos deben devolver la estructura `EncryptResponse` para que el frontend pueda pintar mensajes de error estandarizados sin fallar.
+- **Sanitización de Errores**: Es imperativo **no filtrar errores del sistema operativo** al frontend. Se debe evitar el uso de `.map_err(|e| e.to_string())` en operaciones de I/O de archivos para prevenir la fuga de información sobre la estructura de directorios del usuario. En su lugar, se deben devolver mensajes de error genéricos y amigables.
 - **Validación de Rutas**: Todo backend debe pasar por la función `validate_path` en Rust para evitar escalada de privilegios o `Directory Traversal` (e.g. `../../etc/passwd`).
 - **Lógica Rust**: Siempre que se agreguen nuevos comandos criptográficos, se deben reutilizar las funciones `encrypt_blocks` y `decrypt_blocks` para evitar duplicación del núcleo seguro.
 - **Dependencias Ligeras**: No se deben añadir librerías masivas de frontend (como librerías de componentes UI pesadas). Todos los componentes visuales se construyen artesanalmente con `Tailwind` y `Framer Motion` para mantener el bundle pequeño (actualmente compilado en menos de 1MB gzipped).

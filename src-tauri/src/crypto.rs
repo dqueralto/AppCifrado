@@ -557,19 +557,20 @@ pub async fn decrypt_with_quantum(
     let shared_secret_hex = hex::encode(shared_secret.as_slice());
 
     // Ahora procedemos con el descifrado normal usando ese secreto
-    let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
+    // FIX #1: Sanitización de errores de I/O — sin filtrar rutas del SO al frontend
+    let mut output_file = File::create(&output_path).map_err(|_| "Error al crear el archivo de destino.")?;
 
     let mut salt = [0u8; SALT_SIZE];
     let mut aes_nonce_raw = [0u8; NONCE_SIZE];
     let mut chacha_nonce_raw = [0u8; NONCE_SIZE];
 
-    input_file.read_exact(&mut salt).map_err(|e| e.to_string())?;
-    input_file.read_exact(&mut aes_nonce_raw).map_err(|e| e.to_string())?;
-    input_file.read_exact(&mut chacha_nonce_raw).map_err(|e| e.to_string())?;
+    input_file.read_exact(&mut salt).map_err(|_| "Archivo cuántico corrupto: falta salt")?;
+    input_file.read_exact(&mut aes_nonce_raw).map_err(|_| "Archivo cuántico corrupto: falta nonce AES")?;
+    input_file.read_exact(&mut chacha_nonce_raw).map_err(|_| "Archivo cuántico corrupto: falta nonce ChaCha")?;
 
     let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
-    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|e| e.to_string())?;
-    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|e| e.to_string())?;
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error al inicializar cifrador AES")?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|_| "Error al inicializar cifrador ChaCha20")?;
     let use_compression = (flags & 0x01) != 0;
 
     let mut reader = BufReader::new(input_file);
@@ -589,27 +590,25 @@ pub async fn encrypt_folder(
     password: String,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
-    let temp_tar = format!("{}.tmp_tar", output_path);
+    // FIX #4: Sufijo aleatorio anti-TOCTOU — evita que un atacante prediga la ruta del temporal
+    let mut suffix_bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut suffix_bytes);
+    let temp_tar = format!("{}.tmp_{}", output_path, hex::encode(suffix_bytes));
     
     // Crear el archivo TAR temporal
     {
-        let file = File::create(&temp_tar).map_err(|e| e.to_string())?;
+        let file = File::create(&temp_tar).map_err(|_| "Error al crear archivo temporal")?;
         let mut builder = tar::Builder::new(file);
-        builder.append_dir_all(".", &input_path).map_err(|e| e.to_string())?;
-        builder.finish().map_err(|e| e.to_string())?;
+        builder.append_dir_all(".", &input_path).map_err(|_| "Error al empaquetar carpeta")?;
+        builder.finish().map_err(|_| "Error al finalizar empaquetado")?;
     }
 
-    // Cifrar el archivo TAR temporal como si fuera un archivo normal
-    // Usamos false para shred_original aquí porque nosotros borramos el temporal manualmente abajo
+    // Cifrar el archivo TAR temporal
     let result = encrypt_file(temp_tar.clone(), output_path, password, false).await;
-    
-    // Eliminar el archivo temporal
     let _ = std::fs::remove_file(&temp_tar);
 
     if result.as_ref().is_ok() && shred_original {
-        // BUG FIX #3: Borrado seguro (DoD 5220.22-M) recursivo de la carpeta.
-        // Antes usaba remove_dir_all (borrado simple del SO), contradiciéndose con la garantía de seguridad.
-        // Ahora aplicamos secure_shred a cada archivo antes de eliminar el directorio.
+        // Borrado seguro (DoD 5220.22-M) recursivo de la carpeta
         if let Ok(entries) = std::fs::read_dir(&input_path) {
             for entry in entries.flatten() {
                 if entry.path().is_file() {
@@ -630,19 +629,26 @@ pub async fn decrypt_folder(
     output_path: String,
     password: String,
 ) -> Result<EncryptResponse, String> {
-    let temp_tar = format!("{}.tmp_tar", input_path);
+    // FIX #4: Sufijo aleatorio anti-TOCTOU
+    let mut suffix_bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut suffix_bytes);
+    let temp_tar = format!("{}.tmp_{}", input_path, hex::encode(suffix_bytes));
 
     // Descifrar el contenedor al archivo TAR temporal
-    let result = decrypt_file(input_path, temp_tar.clone(), password).await?;
+    let result = decrypt_file(input_path, temp_tar.clone(), password).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_tar);
+        return result;
+    }
+    let result = result.unwrap();
 
     if result.success {
-        // Extraer el TAR a la carpeta de destino
-        let file = File::open(&temp_tar).map_err(|e| e.to_string())?;
+        // FIX #3: Capturar error de unpack para limpiar el temporal antes de propagar
+        let file = File::open(&temp_tar).map_err(|_| "Error al abrir TAR temporal")?;
         let mut archive = tar::Archive::new(file);
-        archive.unpack(&output_path).map_err(|e| e.to_string())?;
-        
-        // Eliminar el archivo temporal
-        let _ = std::fs::remove_file(&temp_tar);
+        let unpack_result = archive.unpack(&output_path);
+        let _ = std::fs::remove_file(&temp_tar); // Siempre limpiar, haya o no error
+        unpack_result.map_err(|_| "Error al extraer la carpeta del contenedor")?;
 
         Ok(EncryptResponse {
             success: true,
@@ -664,24 +670,25 @@ pub async fn encrypt_folder_with_quantum(
     signing_key_hex: Option<String>,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
-    let temp_tar = format!("{}.tmp_tar", output_path);
+    // FIX #4: Sufijo aleatorio anti-TOCTOU
+    let mut suffix_bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut suffix_bytes);
+    let temp_tar = format!("{}.tmp_{}", output_path, hex::encode(suffix_bytes));
     
     // 1. Crear TAR temporal
     {
-        let file = File::create(&temp_tar).map_err(|e| e.to_string())?;
+        let file = File::create(&temp_tar).map_err(|_| "Error al crear archivo temporal")?;
         let mut builder = tar::Builder::new(file);
-        builder.append_dir_all(".", &input_path).map_err(|e| e.to_string())?;
-        builder.finish().map_err(|e| e.to_string())?;
+        builder.append_dir_all(".", &input_path).map_err(|_| "Error al empaquetar carpeta")?;
+        builder.finish().map_err(|_| "Error al finalizar empaquetado")?;
     }
 
-    // 2. Cifrar con PQC
-    // BUG FIX #5: Antes usábamos `?` que propagaba el error sin limpiar el .tmp_tar huérfano.
-    // Ahora capturamos el Result para garantizar la limpieza del temporal antes de propagar.
+    // 2. Cifrar con PQC — capturar Result para garantizar limpieza del temporal
     let result = encrypt_with_quantum(temp_tar.clone(), output_path, public_key_hex, signing_key_hex, false).await;
     let _ = std::fs::remove_file(&temp_tar); // Siempre limpiar el temporal
-    let result = result?; // Ahora sí propagamos el error si hubo uno
+    let result = result?;
 
-    // BUG FIX #3: Borrado seguro (DoD 5220.22-M) recursivo en lugar de remove_dir_all simple
+    // Borrado seguro (DoD 5220.22-M) recursivo en lugar de remove_dir_all simple
     if result.success && shred_original {
         if let Ok(entries) = std::fs::read_dir(&input_path) {
             for entry in entries.flatten() {
@@ -704,24 +711,25 @@ pub async fn decrypt_folder_with_quantum(
     private_key_hex: String,
     verifier_key_hex: Option<String>,
 ) -> Result<EncryptResponse, String> {
-    let temp_tar = format!("{}.tmp_tar", input_path);
+    // FIX #4: Sufijo aleatorio anti-TOCTOU
+    let mut suffix_bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut suffix_bytes);
+    let temp_tar = format!("{}.tmp_{}", input_path, hex::encode(suffix_bytes));
 
-    // 1. Descifrar con PQC
-    // BUG FIX #5: Capturamos el Result antes de propagar para limpiar .tmp_tar si falla
+    // Descifrar con PQC — capturar Result para limpiar temporal si falla
     let result = decrypt_with_quantum(input_path, temp_tar.clone(), private_key_hex, verifier_key_hex).await;
     if result.is_err() {
-        let _ = std::fs::remove_file(&temp_tar); // Limpiar temporal huérfano
+        let _ = std::fs::remove_file(&temp_tar);
         return result;
     }
     let result = result.unwrap();
 
     if result.success {
-        // 2. Extraer TAR
         let file = File::open(&temp_tar).map_err(|_| "Error al abrir TAR temporal")?;
         let mut archive = tar::Archive::new(file);
-        archive.unpack(&output_path).map_err(|_| "Error al extraer carpeta del contenedor")?;
-        
-        let _ = std::fs::remove_file(&temp_tar);
+        let unpack_result = archive.unpack(&output_path);
+        let _ = std::fs::remove_file(&temp_tar); // Limpiar siempre
+        unpack_result.map_err(|_| "Error al extraer carpeta del contenedor")?;
 
         Ok(EncryptResponse {
             success: true,

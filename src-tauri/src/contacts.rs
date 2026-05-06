@@ -7,7 +7,8 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::{Argon2, Params};
-use rand::{RngCore, thread_rng};
+use rand::{RngCore, rngs::OsRng};
+use zeroize::Zeroizing;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
@@ -76,15 +77,18 @@ fn get_contacts_path(app: &AppHandle) -> PathBuf {
     path
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
-    let mut key = [0u8; 32];
+/// Deriva la clave AES-256 para el vault de contactos usando Argon2id.
+/// Devuelve la clave envuelta en `Zeroizing` para que se borre automáticamente
+/// de la RAM al salir del ámbito (consistente con el resto del proyecto).
+fn derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
     let config = Params::new(65536, 3, 4, None).expect("Parámetros de Argon2 inválidos");
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
         config,
     );
-    let _ = argon2.hash_password_into(password.as_bytes(), salt, &mut key);
+    let _ = argon2.hash_password_into(password.as_bytes(), salt, key.as_mut());
     key
 }
 
@@ -122,7 +126,7 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
     let encrypted_data = hex::decode(store.data).map_err(|e| e.to_string())?;
 
     let key_bytes = derive_key(&pass, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| e.to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|e| e.to_string())?;
 
     let decrypted = cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), encrypted_data.as_slice())
@@ -142,11 +146,12 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
 fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> Result<(), String> {
     let mut salt = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
-    thread_rng().fill_bytes(&mut salt);
-    thread_rng().fill_bytes(&mut nonce_bytes);
+    // FIX #2 (complemento): Usar OsRng en lugar de thread_rng para consistencia criptográfica
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce_bytes);
 
     let key_bytes = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| e.to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|e| e.to_string())?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let json_data = serde_json::to_vec(contacts).map_err(|e| e.to_string())?;
