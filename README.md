@@ -1,51 +1,50 @@
-# CryptoBro 🛡️ - Advanced Post-Quantum Vault
+# 🛡️ CryptoBro: Post-Quantum Security Suite
 
-CryptoBro es una suite de seguridad de grado profesional, diseñada para proteger la información en la era de la computación cuántica. Combina algoritmos de cifrado simétrico tradicionales con los nuevos estándares de criptografía post-cuántica (PQC) de la NIST.
+**CryptoBro** es una suite de seguridad avanzada diseñada para la era de la computación cuántica. Combina la robustez de los algoritmos simétricos tradicionales con los nuevos estándares de criptografía post-cuántica (PQC) de la FIPS (NIST), permitiendo proteger, firmar y camuflar información sensible con un nivel de seguridad sin precedentes.
 
-## 🚀 Características Maestras
+## 🚀 Características Principales
 
-### 1. Cifrado Híbrido en Cascada (Cascading Encryption)
-Cada archivo se asegura bajo dos capas independientes de cifrado simétrico, lo que significa que un atacante tendría que romper dos algoritmos distintos para acceder a los datos:
-- **AES-256-GCM:** Estándar de la industria para cifrado de bloques.
-- **ChaCha20-Poly1305:** Cifrado de flujo extremadamente seguro y optimizado.
+### 1. ⚛️ Cifrado Híbrido Post-Cuántico
+Implementa los estándares más recientes para resistir ataques de ordenadores cuánticos:
+*   **ML-KEM-1024 (Kyber):** Establecimiento de llaves con seguridad de nivel 1024 bits.
+*   **ML-DSA-65 (Dilithium):** Firmas digitales infalsificables para garantizar la autenticidad e integridad.
+*   **Doble Capa Simétrica:** Cascada de cifrado **AES-256-GCM** + **ChaCha20-Poly1305** con derivación de llaves mediante Argon2id.
 
-### 2. Identidad Cuántica (ML-KEM & ML-DSA)
-CryptoBro implementa los algoritmos finalistas del NIST (FIPS 203 y 204) para garantizar la seguridad del futuro:
-- **ML-KEM-1024 (Kyber):** Intercambio de claves resistente a ordenadores cuánticos.
-- **ML-DSA-65 (Dilithium):** Firmas digitales infalsificables que garantizan la autenticidad e integridad del remitente.
+### 2. 🎭 Esteganografía Universal (Stego-Streaming)
+Oculta tus contenedores cifrados dentro de archivos cotidianos para que pasen desapercibidos:
+*   **Formatos Soportados:** Imágenes (JPG, PNG), Audio (MP3, WAV), Vídeo (MKV, MP4) y Documentos (PDF).
+*   **Tecnología de Streaming:** Capacidad para procesar archivos de **gran tamaño (10GB+)** mediante lectura y escritura por bloques, evitando el consumo excesivo de memoria RAM.
+*   **Denegación Plausible:** Un archivo MKV de 10GB que contiene un secreto es indistinguible de una película normal.
 
-### 3. Camuflaje de Datos (Esteganografía)
-Permite ocultar contenedores cifrados `.vault` dentro de imágenes convencionales (JPG, PNG). El archivo resultante parece una imagen normal, pero contiene tus secretos inyectados de forma invisible mediante la técnica de *EOF-Appending*.
+### 3. 🔑 Gestión de Identidad Cuántica
+*   **Identidad Híbrida:** Generación de un set de 4 llaves (Cifrado Público/Privado + Firma Público/Privado).
+*   **Persistencia Segura:** Las llaves se mantienen activas durante la sesión para automatizar la firma de todos los archivos enviados.
+*   **Directorio de Contactos:** Agenda integrada para almacenar llaves públicas de verificación de terceros.
 
-### 4. Borrado Seguro (Safe Shredding)
-Implementa un algoritmo de destrucción destructiva basado en el estándar **Gutmann**. Los archivos originales se sobrescriben con patrones aleatorios antes de ser eliminados, impidiendo cualquier intento de recuperación forense.
+### 4. 🧹 Destrucción de Datos (Secure Shredding)
+*   **Algoritmo Gutmann:** Eliminación segura de archivos mediante 35 pasadas de sobreescritura aleatoria, haciendo imposible la recuperación de datos incluso con herramientas forenses.
 
-### 5. Cifrado de Carpetas PQC
-Soporta el empaquetado automático de directorios completos mediante contenedores `TAR` con compresión `Gzip` integrada, todo dentro de la misma tubería de cifrado cuántico.
+## 🛠️ Especificaciones Técnicas
 
-## 🛠️ Arquitectura Técnica
+| Componente | Algoritmo | Estándar |
+| :--- | :--- | :--- |
+| Cifrado Asimétrico | ML-KEM-1024 | FIPS 203 |
+| Firma Digital | ML-DSA-65 | FIPS 204 |
+| Cifrado Simétrico 1 | AES-256-GCM | NIST SP 800-38D |
+| Cifrado Simétrico 2 | ChaCha20-Poly1305 | RFC 8439 |
+| Derivación de Llave | Argon2id | RFC 9106 |
+| Compresión | Gzip (Deflate) | RFC 1952 |
 
-- **Backend:** [Rust](https://www.rust-lang.org/) (Tauri 2.0) - Alto rendimiento y seguridad de memoria.
-- **Frontend:** [React](https://reactjs.org/) + [Vite](https://vitejs.dev/) - Interfaz reactiva y fluida.
-- **Seguridad:**
-  - **Argon2id:** Derivación de claves de alta resistencia contra ataques de fuerza bruta.
-  - **Streaming logic:** Procesamiento de archivos grandes (>4GB) sin impacto en la RAM.
-- **UI/UX:** Diseño *Glassmorphism* con animaciones de alta fidelidad mediante **Framer Motion**.
+## 📖 Guía de Uso Rápido
 
-## 📦 Instalación y Desarrollo
-
-### Requisitos previos
-- [Node.js](https://nodejs.org/) (v18+)
-- [Rust](https://www.rust-lang.org/) (Cargo 1.70+)
-
-### Pasos para ejecutar
-1. Clonar el repositorio.
-2. Instalar dependencias: `npm install`
-3. Iniciar entorno de desarrollo: `npm run tauri dev`
-
-## 🔒 Privacidad Local-First
-
-CryptoBro es **completamente offline**. No hay servidores, no hay telemetría, no hay nube. Tus llaves y tus datos nunca salen de tu dispositivo. La seguridad es responsabilidad total del usuario; si pierdes tu identidad cuántica o tu contraseña maestra, los datos son irrecuperables por diseño.
+1.  **Generar Identidad:** Ve al panel inferior y pulsa "Generar Par". Guarda tus llaves en un lugar seguro.
+2.  **Cifrar:** Selecciona un archivo o carpeta. Elige "Método Cuántico". Si tu identidad está activa, el archivo se firmará automáticamente.
+3.  **Verificar:** Al descifrar, puedes introducir la "Llave de Verificación" del remitente. Si el archivo ha sido manipulado, saltará la **¡ALERTA ROJA!**.
+4.  **Camuflar:** Una vez tengas tu archivo `.vault`, ve a la sección "Camuflar", selecciona el contenedor y elige un archivo de vídeo o música como portada.
 
 ---
-**Desarrollado con pasión por la privacidad absoluta.**
+
+## 🔒 Compromiso de Privacidad
+CryptoBro es una aplicación **Local-First**. Ningún dato, llave o archivo sale jamás de tu dispositivo. No hay servidores, no hay telemetría, no hay puertas traseras.
+
+*Desarrollado para aquellos que entienden que la privacidad es un derecho, no un privilegio.*

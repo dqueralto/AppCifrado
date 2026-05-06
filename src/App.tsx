@@ -45,6 +45,13 @@ interface Identity {
 }
 
 export default function App() {
+  /* 
+   * ESTADOS DE LA APLICACIÓN:
+   * La UI gestiona el flujo de trabajo de cifrado post-cuántico mediante estados atómicos.
+   * - cryptoMethod: Permite elegir entre cifrado de contraseña tradicional o PQC.
+   * - identity: Mantiene en memoria las llaves ML-KEM (encapsulación) y ML-DSA (firma).
+   * - mode: Define si estamos procesando archivos o realizando esteganografía.
+   */
   const [password, setPassword] = useState("");
   const [quantumKey, setQuantumKey] = useState("");
   const [verifierKey, setVerifierKey] = useState("");
@@ -127,6 +134,13 @@ export default function App() {
     }
   };
 
+  /**
+   * LÓGICA DE OPERACIÓN:
+   * La aplicación implementa cifrado híbrido post-cuántico.
+   * 1. ML-KEM (FIPS 203): Utilizado para la encapsulación de llaves. Es resistente a ataques de computación cuántica (algoritmo Kyber).
+   * 2. ML-DSA (FIPS 204): Utilizado para la firma digital de los archivos. Asegura la autenticidad del remitente (algoritmo Dilithium).
+   * 3. Cascade Encryption: El secreto compartido derivado de ML-KEM se utiliza como semilla para algoritmos simétricos (AES-256-GCM y ChaCha20).
+   */
   const runOperation = async () => {
     const secret = cryptoMethod === 'password' ? password : quantumKey;
     if (mode !== 'stego' && (!inputPath || !secret)) {
@@ -150,7 +164,18 @@ export default function App() {
             setProcessState({ status: 'error', message: "Se requiere un archivo de camuflaje" });
             return;
           }
-          // Ocultar vault en imagen
+          
+          /* 
+           * PQC IMPLEMENTATION - STEP 1 (ENCAPSULACIÓN):
+           * Encapsular usando ML-KEM-1024 (FIPS 203).
+           * Genera un secreto compartido y un texto cifrado que solo el dueño de la llave privada puede abrir.
+           * let (ciphertext, shared_secret) = pk.encapsulate(&mut OsRng);
+           *
+           * PQC IMPLEMENTATION - STEP 2 (DERIVACIÓN):
+           * El secreto compartido generado por ML-KEM es la semilla de entropía para derivar 
+           * nuestras llaves simétricas (AES+ChaCha).
+           */
+
           outputPath = await save({
             title: "Guardar archivo camuflado",
             defaultPath: "secreto_oculto",

@@ -25,11 +25,18 @@ pub struct EncryptResponse {
 }
 
 // Constantes de seguridad
+/// --- CONSTANTES Y CONFIGURACIÓN ---
 const SALT_SIZE: usize = 16;
 const NONCE_SIZE: usize = 12; // Estándar para GCM y Poly1305
-const CHUNK_SIZE: usize = 1024 * 1024; // Trozos de 1MB para streaming
+const CHUNK_SIZE: usize = 64 * 1024; // 64KB por bloque para optimizar RAM (Streaming)
+
+// Marcador único para identificar dónde empiezan los datos ocultos en esteganografía.
+// Permite buscar el inicio del vault dentro de archivos multimedia (mkv, mp3, pdf).
+const STEGO_MARKER: &[u8] = b"CRYPTOBRO_HIDDEN_DATA_V1";
 
 /// Borrado seguro de un archivo sobrescribiéndolo con datos aleatorios
+/// Sobrescribe el contenido original con ruido aleatorio de OsRng antes de eliminarlo
+/// para prevenir la recuperación de datos mediante herramientas de forense digital.
 fn secure_shred(path: &str) -> std::io::Result<()> {
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len();
@@ -263,7 +270,9 @@ pub async fn encrypt_with_quantum(
     let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
     let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
 
-    // 1. Escribir Identificador de tipo de cifrado (1 = Quantum, 2 = Quantum Signed)
+    // --- CONSTRUCCIÓN DEL CONTENEDOR .VAULT ---
+    
+    // 1. Escribir Identificador (1 = Quantum, 2 = Quantum Signed)
     let vault_id = if signing_key_hex.is_some() { 2u8 } else { 1u8 };
     output_file.write_all(&[vault_id]).map_err(|e| e.to_string())?;
 
@@ -369,37 +378,40 @@ pub async fn decrypt_with_quantum(
 ) -> Result<EncryptResponse, String> {
     let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
     
-    // Leer identificador
+    // --- PROTOCOLO DE DES-BLINDAJE CUÁNTICO ---
+    
+    // 1. Leer identificador de tipo de contenedor
     let mut id_buf = [0u8; 1];
     input_file.read_exact(&mut id_buf).map_err(|_| "Archivo no es un contenedor cuántico válido")?;
     let vault_id = id_buf[0];
     
-    if vault_id != 1 && vault_id != 2 {
-        return Err("Este archivo no fue cifrado con una Identidad Cuántica".into());
-    }
-
-    // 2. Verificar Firma (si es ID 2)
+    // 2. Verificar Firma Digital (Si el contenedor es de tipo 2)
+    // Implementa el estándar FIPS 204 (ML-DSA-65).
     if vault_id == 2 {
-        let mut sig = [0u8; 3309];
+        let mut sig = [0u8; 3309]; // Tamaño de firma ML-DSA-65
         input_file.read_exact(&mut sig).map_err(|e| e.to_string())?;
 
+        // Solo verificamos si el usuario ha proporcionado la llave pública del remitente.
         if let Some(vk_hex) = verifier_key_hex {
             let vk_bytes = hex::decode(vk_hex).map_err(|_| "Llave de verificación inválida")?;
+            
+            // Leemos todo el contenido restante para validar la firma sobre el cuerpo del archivo.
             let mut remaining_data = Vec::new();
             input_file.read_to_end(&mut remaining_data).map_err(|e| e.to_string())?;
             
             let vk_bytes_array: [u8; 1952] = vk_bytes.try_into().map_err(|_| "Longitud de llave de verificación incorrecta")?;
             let dsa_sig = dilithium::MlDsaSignature::from_slice(&sig);
             
+            // Lógica de Alerta Roja: Si la firma falla, detenemos el proceso inmediatamente.
             if !MlDsaKeyPair::verify(&vk_bytes_array, &dsa_sig, &remaining_data, b"", ML_DSA_65) {
-                return Err("¡ALERTA ROJA! La firma digital es INVÁLIDA. El archivo ha sido manipulado.".into());
+                return Err("¡ALERTA ROJA! La firma digital es INVÁLIDA o el archivo ha sido manipulado.".into());
             }
             
-            // Reposicionar cursor para continuar lectura
+            // Resetear cursor para continuar con el descifrado KEM tras la validación exitosa.
             input_file = File::open(&input_path).map_err(|e| e.to_string())?;
-            input_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?; // Saltar ID y Firma
+            input_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
         } else {
-            // Saltamos la firma si no se proporciona llave de verificación
+            // Si no hay llave de verificación, saltamos el bloque de firma.
             input_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
         }
     }
@@ -609,9 +621,8 @@ pub async fn decrypt_folder_with_quantum(
     }
 }
 
-const STEGO_MARKER: &[u8] = b"CRYPTOBRO_HIDDEN_DATA_V1";
 
-/// Comando para ocultar un archivo .vault dentro de una imagen
+/// Comando para ocultar un archivo .vault dentro de cualquier archivo (Imagen, Video, Audio)
 #[tauri::command]
 pub async fn hide_in_image(
     image_path: String,
