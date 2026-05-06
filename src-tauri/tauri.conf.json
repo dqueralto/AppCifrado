@@ -13,9 +13,9 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "CryptoBro - Multi-Capa PQC",
+        "title": "",
         "width": 850,
-        "height": 650,
+        "height": 850,
         "transparent": true,
         "decorations": true,
         "titleBarStyle": "Overlay"
