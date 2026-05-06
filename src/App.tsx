@@ -977,8 +977,8 @@ export default function App() {
         </AnimatePresence>
 
         {/* Subtle Bottom Credits */}
-        <p className="text-center mt-6 text-[10px] text-white/20 uppercase tracking-[0.4em]">
-          CryptoBro • Post-Quantum Secure Vault • Local-First
+        <p className="text-center mt-6 text-[10px] text-white/10 uppercase font-bold tracking-[0.4em]">
+          © Daniel Q. Parra
         </p>
       </motion.div>
     </div>
