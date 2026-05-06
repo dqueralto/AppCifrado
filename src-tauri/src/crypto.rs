@@ -16,6 +16,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
 
 #[derive(Serialize, Deserialize)]
 pub struct EncryptResponse {
@@ -62,6 +63,20 @@ fn secure_shred(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Genera un Nonce único para cada bloque del archivo.
+/// Combina el Nonce base (aleatorio, por archivo) con el índice del bloque
+/// para garantizar que nunca se reutiliza el mismo Nonce + Clave en AES-GCM o ChaCha20.
+/// CRÍTICO: Reutilizar el mismo Nonce en AES-GCM con la misma clave es una vulnerabilidad grave.
+fn derive_block_nonce(base_nonce: &[u8; 12], block_index: u64) -> [u8; 12] {
+    let mut nonce = *base_nonce;
+    let counter_bytes = block_index.to_be_bytes();
+    // XOR los últimos 8 bytes con el contador del bloque
+    for i in 0..8 {
+        nonce[4 + i] ^= counter_bytes[i];
+    }
+    nonce
+}
+
 /// Deriva claves simétricas a partir de una contraseña usando Argon2id
 pub fn derive_keys(password: &str, salt: &[u8]) -> (Vec<u8>, Vec<u8>) {
     // Configuración de Argon2id (Parámetros de grado militar)
@@ -78,6 +93,93 @@ pub fn derive_keys(password: &str, salt: &[u8]) -> (Vec<u8>, Vec<u8>) {
     
     // Devolvemos dos claves de 32 bytes (una para AES y otra para ChaCha20)
     (output[0..32].to_vec(), output[32..64].to_vec())
+}
+
+/// Cifra un stream de datos en bloques con doble capa (AES-256-GCM + ChaCha20-Poly1305).
+/// Función reutilizable por encrypt_file y encrypt_with_quantum para evitar duplicación.
+fn encrypt_blocks(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    aes_cipher: &Aes256Gcm,
+    chacha_cipher: &ChaCha20Poly1305,
+    aes_nonce_raw: &[u8; 12],
+    chacha_nonce_raw: &[u8; 12],
+) -> Result<(), String> {
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut block_index: u64 = 0;
+    loop {
+        let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 { break; }
+        let chunk = &buffer[..count];
+
+        // Comprimir con Gzip
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(chunk).map_err(|e| e.to_string())?;
+        let compressed = encoder.finish().map_err(|e| e.to_string())?;
+
+        // Nonce único por bloque
+        let aes_nonce = derive_block_nonce(aes_nonce_raw, block_index);
+        let chacha_nonce = derive_block_nonce(chacha_nonce_raw, block_index);
+
+        // Doble capa de cifrado
+        let enc_aes = aes_cipher.encrypt(Nonce::from_slice(&aes_nonce), compressed.as_slice()).map_err(|e| e.to_string())?;
+        let enc_final = chacha_cipher.encrypt(Nonce::from_slice(&chacha_nonce), enc_aes.as_slice()).map_err(|e| e.to_string())?;
+
+        // Escribir: longitud (4 bytes) + datos cifrados
+        let len = enc_final.len() as u32;
+        writer.write_all(&len.to_be_bytes()).map_err(|e| e.to_string())?;
+        writer.write_all(&enc_final).map_err(|e| e.to_string())?;
+        block_index += 1;
+    }
+    Ok(())
+}
+
+/// Descifra un stream de bloques revirtiendo la doble capa (ChaCha20 → AES → Gzip).
+/// Función reutilizable por decrypt_file y decrypt_with_quantum.
+fn decrypt_blocks(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    aes_cipher: &Aes256Gcm,
+    chacha_cipher: &ChaCha20Poly1305,
+    aes_nonce_raw: &[u8; 12],
+    chacha_nonce_raw: &[u8; 12],
+    use_compression: bool,
+) -> Result<(), String> {
+    let mut len_buf = [0u8; 4];
+    let mut block_index: u64 = 0;
+    loop {
+        match reader.read_exact(&mut len_buf) {
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.to_string()),
+        }
+        let chunk_len = u32::from_be_bytes(len_buf) as usize;
+        let mut chunk = vec![0u8; chunk_len];
+        reader.read_exact(&mut chunk).map_err(|_| "Contenedor corrupto: bloque de datos incompleto")?;
+
+        let aes_nonce = derive_block_nonce(aes_nonce_raw, block_index);
+        let chacha_nonce = derive_block_nonce(chacha_nonce_raw, block_index);
+
+        // Revertir capas
+        let dec_chacha = chacha_cipher.decrypt(Nonce::from_slice(&chacha_nonce), chunk.as_slice())
+            .map_err(|_| "Fallo en Capa 2 (ChaCha20): datos corruptos o clave incorrecta")?;
+        let dec_aes = aes_cipher.decrypt(Nonce::from_slice(&aes_nonce), dec_chacha.as_slice())
+            .map_err(|_| "Fallo en Capa 1 (AES-GCM): datos corruptos o clave incorrecta")?;
+
+        // Descomprimir si aplica
+        let final_data = if use_compression {
+            let mut decoder = GzDecoder::new(dec_aes.as_slice());
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).map_err(|e| e.to_string())?;
+            decompressed
+        } else {
+            dec_aes
+        };
+
+        writer.write_all(&final_data).map_err(|e| e.to_string())?;
+        block_index += 1;
+    }
+    Ok(())
 }
 
 /// Comando para cifrar un archivo con múltiples capas (AES-256 + ChaCha20)
@@ -113,33 +215,7 @@ pub async fn encrypt_file(
     let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
 
-    let mut buffer = vec![0u8; CHUNK_SIZE];
-    loop {
-        let count = input_file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 { break; }
-
-        let chunk = &buffer[..count];
-        
-        // Fase 0: Compresión Gzip del trozo
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(chunk).map_err(|e| e.to_string())?;
-        let compressed_chunk = encoder.finish().map_err(|e| e.to_string())?;
-
-        // Capa 1: AES-256-GCM
-        let encrypted_aes = aes_cipher
-            .encrypt(Nonce::from_slice(&aes_nonce_raw), compressed_chunk.as_slice())
-            .map_err(|e| e.to_string())?;
-            
-        // Capa 2: ChaCha20-Poly1305
-        let encrypted_final = chacha_cipher
-            .encrypt(Nonce::from_slice(&chacha_nonce_raw), encrypted_aes.as_slice())
-            .map_err(|e| e.to_string())?;
-
-        // Escribir longitud del trozo final
-        let len = encrypted_final.len() as u32;
-        output_file.write_all(&len.to_be_bytes()).map_err(|e| e.to_string())?;
-        output_file.write_all(&encrypted_final).map_err(|e| e.to_string())?;
-    }
+    encrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw)?;
 
     if shred_original {
         let _ = secure_shred(&input_path);
@@ -180,38 +256,9 @@ pub async fn decrypt_file(
     
     let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
+    let use_compression = (flags & 0x01) != 0;
 
-    let mut len_buf = [0u8; 4];
-    loop {
-        if input_file.read_exact(&mut len_buf).is_err() { break; }
-        let chunk_len = u32::from_be_bytes(len_buf) as usize;
-        
-        let mut chunk = vec![0u8; chunk_len];
-        input_file.read_exact(&mut chunk).map_err(|e| e.to_string())?;
-
-        // Revertir capas (de fuera hacia dentro)
-        // Descifrar Capa 2: ChaCha20-Poly1305
-        let decrypted_chacha = chacha_cipher
-            .decrypt(Nonce::from_slice(&chacha_nonce_raw), chunk.as_slice())
-            .map_err(|_| "Error de descifrado: Fallo en Capa 2 (ChaCha20)".to_string())?;
-            
-        // Descifrar Capa 1: AES-256-GCM
-        let decrypted_aes = aes_cipher
-            .decrypt(Nonce::from_slice(&aes_nonce_raw), decrypted_chacha.as_slice())
-            .map_err(|_| "Error de descifrado: Fallo en Capa 1 (AES-GCM)".to_string())?;
-
-        // Fase Final: Descompresión si aplica
-        let decrypted_final = if (flags & 0x01) != 0 {
-            let mut decoder = GzDecoder::new(decrypted_aes.as_slice());
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed).map_err(|e| e.to_string())?;
-            decompressed
-        } else {
-            decrypted_aes
-        };
-
-        output_file.write_all(&decrypted_final).map_err(|e| e.to_string())?;
-    }
+    decrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw, use_compression)?;
 
     Ok(EncryptResponse {
         success: true,
@@ -308,51 +355,42 @@ pub async fn encrypt_with_quantum(
     let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
 
-    let mut buffer = vec![0u8; CHUNK_SIZE];
-    loop {
-        let count = input_file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 { break; }
-        let chunk = &buffer[..count];
-        
-        // Fase 0: Compresión
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(chunk).map_err(|e| e.to_string())?;
-        let compressed_chunk = encoder.finish().map_err(|e| e.to_string())?;
-
-        let encrypted_aes = aes_cipher.encrypt(Nonce::from_slice(&aes_nonce_raw), compressed_chunk.as_slice()).map_err(|e| e.to_string())?;
-        let encrypted_final = chacha_cipher.encrypt(Nonce::from_slice(&chacha_nonce_raw), encrypted_aes.as_slice()).map_err(|e| e.to_string())?;
-
-        let len = encrypted_final.len() as u32;
-        output_file.write_all(&len.to_be_bytes()).map_err(|e| e.to_string())?;
-        output_file.write_all(&encrypted_final).map_err(|e| e.to_string())?;
-    }
+    encrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw)?;
 
     // Finalizar escritura y asegurar en disco
     output_file.flush().map_err(|e| e.to_string())?;
     output_file.sync_all().map_err(|e| e.to_string())?;
     drop(output_file);
 
-    // 5. Firma Digital (si aplica)
+    // 5. Firma Digital con Hash Streaming (evita cargar el archivo completo en RAM)
     if let Some(sk_combined_hex) = signing_key_hex {
         let parts: Vec<&str> = sk_combined_hex.split(':').collect();
         if parts.len() == 2 {
             let vk_bytes = hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
             let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
-            
-            // Re-abrir para firmar
-            let mut file_data = fs::read(&output_path).map_err(|e| e.to_string())?;
-            
-            // El "mensaje" a firmar es todo el archivo DESPUÉS del espacio de la firma
-            // ID (1 byte) + Firma (3309 bytes) + Datos...
-            let msg_to_sign = &file_data[3310..];
-            
+
+            // Calcular SHA-256 del cuerpo del archivo (desde byte 3310) mediante streaming
+            // Esto evita cargar archivos de varios GB en RAM para calcular la firma.
+            let mut hasher = Sha256::new();
+            let mut sign_file = File::open(&output_path).map_err(|e| e.to_string())?;
+            sign_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
+            let mut hash_buf = [0u8; 65536];
+            loop {
+                let n = sign_file.read(&mut hash_buf).map_err(|e| e.to_string())?;
+                if n == 0 { break; }
+                hasher.update(&hash_buf[..n]);
+            }
+            let file_hash = hasher.finalize();
+
             let dsa_vk_bytes: [u8; 1952] = vk_bytes.try_into().map_err(|_| "Longitud de llave pública de firma incorrecta")?;
             let dsa_sk_bytes: [u8; 4032] = sk_bytes.try_into().map_err(|_| "Longitud de llave privada de firma incorrecta")?;
-            
+
             let dsa_kp = MlDsaKeyPair::from_keys(&dsa_sk_bytes, &dsa_vk_bytes, ML_DSA_65).map_err(|e| e.to_string())?;
-            let sig = dsa_kp.sign(msg_to_sign, b"").map_err(|e| e.to_string())?;
-            
-            // Insertar firma en el marcador de posición
+            // Firmamos el hash del archivo (no el archivo completo)
+            let sig = dsa_kp.sign(file_hash.as_slice(), b"").map_err(|e| e.to_string())?;
+
+            // Leer el archivo completo para insertar la firma
+            let mut file_data = fs::read(&output_path).map_err(|e| e.to_string())?;
             file_data[1..3310].copy_from_slice(sig.as_bytes());
             fs::write(&output_path, file_data).map_err(|e| e.to_string())?;
         }
@@ -395,19 +433,25 @@ pub async fn decrypt_with_quantum(
         if let Some(vk_hex) = verifier_key_hex {
             let vk_bytes = hex::decode(vk_hex).map_err(|_| "Llave de verificación inválida")?;
             
-            // Leemos todo el contenido restante para validar la firma sobre el cuerpo del archivo.
-            let mut remaining_data = Vec::new();
-            input_file.read_to_end(&mut remaining_data).map_err(|e| e.to_string())?;
+            // Calcular SHA-256 del cuerpo del archivo mediante streaming (evita cargar el archivo en RAM)
+            let mut hasher = Sha256::new();
+            let mut hash_buf = [0u8; 65536];
+            loop {
+                let n = input_file.read(&mut hash_buf).map_err(|e| e.to_string())?;
+                if n == 0 { break; }
+                hasher.update(&hash_buf[..n]);
+            }
+            let file_hash = hasher.finalize();
             
             let vk_bytes_array: [u8; 1952] = vk_bytes.try_into().map_err(|_| "Longitud de llave de verificación incorrecta")?;
             let dsa_sig = dilithium::MlDsaSignature::from_slice(&sig);
             
-            // Lógica de Alerta Roja: Si la firma falla, detenemos el proceso inmediatamente.
-            if !MlDsaKeyPair::verify(&vk_bytes_array, &dsa_sig, &remaining_data, b"", ML_DSA_65) {
+            // Alerta Roja: verificamos el hash del cuerpo, no el cuerpo completo
+            if !MlDsaKeyPair::verify(&vk_bytes_array, &dsa_sig, file_hash.as_slice(), b"", ML_DSA_65) {
                 return Err("¡ALERTA ROJA! La firma digital es INVÁLIDA o el archivo ha sido manipulado.".into());
             }
             
-            // Resetear cursor para continuar con el descifrado KEM tras la validación exitosa.
+            // Resetear cursor para continuar con el descifrado KEM
             input_file = File::open(&input_path).map_err(|e| e.to_string())?;
             input_file.seek(SeekFrom::Start(3310)).map_err(|e| e.to_string())?;
         } else {
@@ -453,38 +497,10 @@ pub async fn decrypt_with_quantum(
     let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
     let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
+    let use_compression = (flags & 0x01) != 0;
 
-    let mut len_buf = [0u8; 4];
     let mut reader = BufReader::new(input_file);
-
-    loop {
-        let n = reader.read(&mut len_buf).map_err(|e| e.to_string())?;
-        if n == 0 { break; } // EOF normal
-        if n < 4 { 
-            return Err("Contenedor corrupto: marcador de bloque incompleto al final del archivo".into());
-        }
-
-        let chunk_len = u32::from_be_bytes(len_buf) as usize;
-        let mut chunk = vec![0u8; chunk_len];
-        reader.read_exact(&mut chunk).map_err(|_| "Contenedor corrupto: el archivo terminó antes de poder leer el último bloque de datos")?;
-
-        let decrypted_chacha = chacha_cipher.decrypt(Nonce::from_slice(&chacha_nonce_raw), chunk.as_slice())
-            .map_err(|_| "Fallo en Capa 2")?;
-        let decrypted_aes = aes_cipher.decrypt(Nonce::from_slice(&aes_nonce_raw), decrypted_chacha.as_slice())
-            .map_err(|_| "Fallo en Capa 1")?;
-
-        // Descompresión
-        let decrypted_final = if (flags & 0x01) != 0 {
-            let mut decoder = GzDecoder::new(decrypted_aes.as_slice());
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed).map_err(|e| e.to_string())?;
-            decompressed
-        } else {
-            decrypted_aes
-        };
-
-        output_file.write_all(&decrypted_final).map_err(|e| e.to_string())?;
-    }
+    decrypt_blocks(&mut reader, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw, use_compression)?;
 
     Ok(EncryptResponse {
         success: true,

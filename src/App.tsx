@@ -69,31 +69,58 @@ export default function App() {
   const [showKeyGuide, setShowKeyGuide] = useState(false);
   const [showIdentityModal, setShowIdentityModal] = useState(false);
   const [carrierPath, setCarrierPath] = useState("");
+  const [contactsPassword, setContactsPassword] = useState(""); // Contraseña de la libreta
+  const [isContactsUnlocked, setIsContactsUnlocked] = useState(false); // Estado de desbloqueo
+  const [copiedContact, setCopiedContact] = useState<string | null>(null); // Para feedback de copia
+  const [copiedToast, setCopiedToast] = useState(false); // Toast de copiado en portapapeles
 
   useEffect(() => {
     loadContacts();
   }, []);
 
-  const loadContacts = async () => {
-    const list: any = await invoke("get_contacts");
-    setContacts(list);
+  const loadContacts = async (pass?: string) => {
+    try {
+      const p = pass || contactsPassword;
+      const list: any = await invoke("get_contacts", { password: p || null });
+      setContacts(list);
+      if (p) setIsContactsUnlocked(true);
+    } catch (err) {
+      if (pass || contactsPassword) {
+        setProcessState({ status: 'error', message: "Contraseña de contactos incorrecta o error de acceso" });
+        setIsContactsUnlocked(false);
+      }
+      setContacts([]);
+    }
   };
 
   const handleAddContact = async () => {
-    if (!newContact.name || !newContact.key) return;
-    await invoke("save_contact", { name: newContact.name, publicKey: newContact.key });
-    setNewContact({ name: "", key: "" });
-    loadContacts();
+    if (!newContact.name || !newContact.key || !contactsPassword) return;
+    try {
+      await invoke("save_contact", { 
+        password: contactsPassword, 
+        name: newContact.name, 
+        publicKey: newContact.key 
+      });
+      setNewContact({ name: "", key: "" });
+      loadContacts();
+    } catch (err) {
+      setProcessState({ status: 'error', message: String(err) });
+    }
   };
 
   const handleDeleteContact = async (name: string) => {
-    await invoke("delete_contact", { name });
-    loadContacts();
+    try {
+      await invoke("delete_contact", { password: contactsPassword, name });
+      loadContacts();
+    } catch (err) {
+      setProcessState({ status: 'error', message: String(err) });
+    }
   };
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    alert("Copiado al portapapeles");
+    setCopiedToast(true);
+    setTimeout(() => setCopiedToast(false), 2000);
   };
 
   const handleGenerateIdentity = async () => {
@@ -660,6 +687,21 @@ export default function App() {
           </div>
         </div>
 
+        {/* Toast de copiado */}
+        <AnimatePresence>
+          {copiedToast && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 20 }}
+              className="fixed bottom-6 right-6 z-50 bg-brand-emerald/90 text-black text-xs font-bold px-5 py-3 rounded-2xl shadow-2xl backdrop-blur-md flex items-center gap-2"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              Copiado al portapapeles
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Identity Modal */}
         <AnimatePresence>
           {showIdentityModal && identity && (
@@ -820,64 +862,116 @@ export default function App() {
                 exit={{ opacity: 0, scale: 0.9, y: 20 }}
                 className="w-full max-w-lg bg-zinc-900 border border-white/10 rounded-[32px] overflow-hidden shadow-2xl"
               >
-                <div className="p-8 space-y-6">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                        <Users className="text-brand-cyan w-5 h-5" /> Libreta de Contactos
-                      </h2>
-                      <p className="text-xs text-white/40 mt-1">Llaves Públicas Guardadas</p>
+                {!isContactsUnlocked ? (
+                  /* Password Prompt for Contacts */
+                  <div className="p-8 space-y-6">
+                    <div className="text-center space-y-2">
+                      <div className="w-16 h-16 bg-brand-cyan/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <Lock className="text-brand-cyan w-8 h-8" />
+                      </div>
+                      <h2 className="text-xl font-bold text-white">Libreta Bloqueada</h2>
+                      <p className="text-xs text-white/40">Introduce tu contraseña maestra para acceder</p>
                     </div>
-                    <button onClick={() => setShowContacts(false)} className="text-white/20 hover:text-white/60 transition-colors">
-                      <XCircle className="w-6 h-6" />
-                    </button>
-                  </div>
-
-                  {/* Add Contact Form */}
-                  <div className="bg-white/5 border border-white/5 p-4 rounded-2xl space-y-3">
-                    <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest px-1">Añadir Nuevo</p>
-                    <input
-                      type="text"
-                      placeholder="Nombre del contacto..."
-                      value={newContact.name}
-                      onChange={e => setNewContact({ ...newContact, name: e.target.value })}
-                      className="w-full bg-black/40 border border-white/5 rounded-xl px-4 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-brand-cyan/40"
-                    />
-                    <textarea
-                      placeholder="Llave pública hexadecimal..."
-                      value={newContact.key}
-                      onChange={e => setNewContact({ ...newContact, key: e.target.value })}
-                      className="w-full h-20 bg-black/40 border border-white/5 rounded-xl px-4 py-2 text-[9px] font-mono focus:outline-none focus:ring-1 focus:ring-brand-cyan/40 resize-none"
-                    />
-                    <button
-                      onClick={handleAddContact}
-                      className="w-full py-2 bg-brand-cyan text-black font-bold text-[10px] rounded-xl hover:bg-white transition-colors uppercase tracking-widest"
-                    >
-                      Guardar Contacto
-                    </button>
-                  </div>
-
-                  {/* Contacts List */}
-                  <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-2">
-                    {contacts.length === 0 && (
-                      <p className="text-center text-xs text-white/20 py-4 italic">No hay contactos guardados</p>
-                    )}
-                    {contacts.map(c => (
-                      <div key={c.name} className="flex items-center justify-between p-3 bg-white/[0.02] border border-white/5 rounded-xl group hover:bg-white/5 transition-colors">
-                        <div className="flex-1 min-w-0 pr-4">
-                          <p className="text-xs font-bold text-white/80">{c.name}</p>
-                          <p className="text-[9px] text-white/20 font-mono truncate">{c.public_key}</p>
-                        </div>
-                        <button
-                          onClick={() => handleDeleteContact(c.name)}
-                          className="text-white/10 hover:text-red-400 transition-colors"
+                    <div className="space-y-4">
+                      <input
+                        type="password"
+                        placeholder="Contraseña de la bóveda..."
+                        value={contactsPassword}
+                        onChange={e => setContactsPassword(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && loadContacts()}
+                        className="w-full bg-black/40 border border-white/10 rounded-2xl px-6 py-4 text-center focus:outline-none focus:ring-2 focus:ring-brand-cyan/20"
+                      />
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => setShowContacts(false)}
+                          className="flex-1 py-3 bg-white/5 rounded-2xl text-[10px] font-bold uppercase tracking-widest text-white/40"
                         >
-                          <Trash2 className="w-4 h-4" />
+                          Cancelar
+                        </button>
+                        <button 
+                          onClick={() => loadContacts()}
+                          className="flex-1 py-3 bg-brand-cyan text-black rounded-2xl text-[10px] font-bold uppercase tracking-widest"
+                        >
+                          Desbloquear
                         </button>
                       </div>
-                    ))}
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  /* Contacts Content (Unlocked) */
+                  <div className="p-8 space-y-6">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                          <Users className="text-brand-cyan w-5 h-5" /> Libreta de Contactos
+                        </h2>
+                        <p className="text-xs text-white/40 mt-1">Llaves Públicas Guardadas (Cifrado AES-256)</p>
+                      </div>
+                      <button onClick={() => setShowContacts(false)} className="text-white/20 hover:text-white/60 transition-colors">
+                        <XCircle className="w-6 h-6" />
+                      </button>
+                    </div>
+
+                    {/* Add Contact Form */}
+                    <div className="bg-white/5 border border-white/5 p-4 rounded-2xl space-y-3">
+                      <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest px-1">Añadir Nuevo</p>
+                      <input
+                        type="text"
+                        placeholder="Nombre del contacto..."
+                        value={newContact.name}
+                        onChange={e => setNewContact({ ...newContact, name: e.target.value })}
+                        className="w-full bg-black/40 border border-white/5 rounded-xl px-4 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-brand-cyan/40"
+                      />
+                      <textarea
+                        placeholder="Llave pública hexadecimal..."
+                        value={newContact.key}
+                        onChange={e => setNewContact({ ...newContact, key: e.target.value })}
+                        className="w-full h-20 bg-black/40 border border-white/5 rounded-xl px-4 py-2 text-[9px] font-mono focus:outline-none focus:ring-1 focus:ring-brand-cyan/40 resize-none"
+                      />
+                      <button
+                        onClick={handleAddContact}
+                        className="w-full py-2 bg-brand-cyan text-black font-bold text-[10px] rounded-xl hover:bg-white transition-colors uppercase tracking-widest"
+                      >
+                        Guardar Contacto
+                      </button>
+                    </div>
+
+                    {/* Contacts List */}
+                    <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-2">
+                      {contacts.length === 0 && (
+                        <p className="text-center text-xs text-white/20 py-4 italic">No hay contactos guardados</p>
+                      )}
+                      {contacts.map(c => (
+                        <div
+                          key={c.name}
+                          onClick={() => {
+                            navigator.clipboard.writeText(c.public_key);
+                            setCopiedContact(c.name);
+                            setTimeout(() => setCopiedContact(null), 1500);
+                          }}
+                          className="flex items-center justify-between p-3 bg-white/[0.02] border border-white/5 rounded-xl group hover:bg-white/5 hover:border-brand-cyan/20 transition-all cursor-pointer"
+                          title="Clic para copiar llave pública"
+                        >
+                          <div className="flex-1 min-w-0 pr-4">
+                            <div className="flex items-center gap-2">
+                              <p className="text-xs font-bold text-white/80">{c.name}</p>
+                              {copiedContact === c.name && (
+                                <span className="text-[9px] text-brand-emerald font-bold uppercase tracking-widest">✓ Copiada</span>
+                              )}
+                            </div>
+                            <p className="text-[9px] text-white/20 font-mono truncate">{c.public_key}</p>
+                          </div>
+                          <button
+                            onClick={e => { e.stopPropagation(); handleDeleteContact(c.name); }}
+                            className="text-white/10 hover:text-red-400 transition-colors flex-shrink-0"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </motion.div>
             </div>
           )}

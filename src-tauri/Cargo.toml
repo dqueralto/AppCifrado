@@ -35,4 +35,5 @@ tar = "0.4"
 walkdir = "2"
 kem = "0.3.0-pre.0"
 dilithium-rs = "0.2.0"
+sha2 = "0.10"
 

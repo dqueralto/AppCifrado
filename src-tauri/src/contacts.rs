@@ -1,6 +1,58 @@
 use serde::{Serialize, Deserialize};
 use std::fs;
 use tauri::{AppHandle, Manager};
+use std::path::PathBuf;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use argon2::Argon2;
+use rand::{RngCore, thread_rng};
+use std::sync::Mutex;
+use std::collections::HashMap;
+use std::time::{Instant, Duration};
+
+// --- Protección contra fuerza bruta ---
+// Almacena el número de intentos fallidos y el momento del primer fallo.
+// Se reinicia si pasan más de 30 segundos desde el último intento fallido.
+static FAILED_ATTEMPTS: std::sync::LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const MAX_ATTEMPTS: u32 = 5;
+const LOCKOUT_DURATION: Duration = Duration::from_secs(30);
+
+fn check_and_register_attempt(key: &str, success: bool) -> Result<(), String> {
+    let mut map = FAILED_ATTEMPTS.lock().map_err(|e| e.to_string())?;
+    
+    if success {
+        map.remove(key);
+        return Ok(());
+    }
+
+    let entry = map.entry(key.to_string()).or_insert((0, Instant::now()));
+
+    // Resetear si el bloqueo ha expirado
+    if entry.1.elapsed() > LOCKOUT_DURATION {
+        *entry = (0, Instant::now());
+    }
+
+    entry.0 += 1;
+
+    if entry.0 >= MAX_ATTEMPTS {
+        let remaining = LOCKOUT_DURATION
+            .checked_sub(entry.1.elapsed())
+            .unwrap_or(Duration::ZERO);
+        return Err(format!(
+            "Demasiados intentos fallidos. Espera {} segundos antes de intentarlo de nuevo.",
+            remaining.as_secs()
+        ));
+    }
+
+    Err(format!(
+        "Contraseña incorrecta. Intentos restantes: {}",
+        MAX_ATTEMPTS - entry.0
+    ))
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Contact {
@@ -8,46 +60,131 @@ pub struct Contact {
     pub public_key: String,
 }
 
-fn get_contacts_path(app: &AppHandle) -> std::path::PathBuf {
+#[derive(Serialize, Deserialize)]
+struct EncryptedStore {
+    pub salt: String,
+    pub nonce: String,
+    pub data: String,
+}
+
+fn get_contacts_path(app: &AppHandle) -> PathBuf {
     let mut path = app.path().app_config_dir().expect("No se pudo encontrar el directorio de configuración");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
-    path.push("contacts.json");
+    path.push("contacts.vault");
     path
 }
 
+fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let argon2 = Argon2::default();
+    let _ = argon2.hash_password_into(password.as_bytes(), salt, &mut key);
+    key
+}
+
 #[tauri::command]
-pub fn get_contacts(app: AppHandle) -> Vec<Contact> {
+pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Contact>, String> {
     let path = get_contacts_path(&app);
-    if let Ok(content) = fs::read_to_string(path) {
-        serde_json::from_str(&content).unwrap_or_else(|_| vec![])
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let pass = password.ok_or("Se requiere contraseña maestra para abrir la libreta")?;
+    
+    // Verificar si está bloqueado antes de intentar
+    {
+        let map = FAILED_ATTEMPTS.lock().map_err(|e| e.to_string())?;
+        if let Some((attempts, since)) = map.get("contacts") {
+            if *attempts >= MAX_ATTEMPTS && since.elapsed() < LOCKOUT_DURATION {
+                let remaining = LOCKOUT_DURATION
+                    .checked_sub(since.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                return Err(format!(
+                    "Libreta bloqueada. Espera {} segundos.",
+                    remaining.as_secs()
+                ));
+            }
+        }
+    }
+
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let store: EncryptedStore = serde_json::from_str(&content)
+        .map_err(|_| "Error al leer la bóveda de contactos")?;
+
+    let salt = hex::decode(store.salt).map_err(|e| e.to_string())?;
+    let nonce_bytes = hex::decode(store.nonce).map_err(|e| e.to_string())?;
+    let encrypted_data = hex::decode(store.data).map_err(|e| e.to_string())?;
+
+    let key_bytes = derive_key(&pass, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| e.to_string())?;
+
+    let decrypted = cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), encrypted_data.as_slice())
+        .map_err(|_| {
+            // Registrar intento fallido
+            let _ = check_and_register_attempt("contacts", false);
+            "Contraseña de contactos incorrecta"
+        })?;
+
+    // Descifrado exitoso: resetear contador
+    let _ = check_and_register_attempt("contacts", true);
+
+    let contacts: Vec<Contact> = serde_json::from_slice(&decrypted).map_err(|e| e.to_string())?;
+    Ok(contacts)
+}
+
+fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> Result<(), String> {
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 12];
+    thread_rng().fill_bytes(&mut salt);
+    thread_rng().fill_bytes(&mut nonce_bytes);
+
+    let key_bytes = derive_key(password, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| e.to_string())?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let json_data = serde_json::to_vec(contacts).map_err(|e| e.to_string())?;
+    let encrypted_data = cipher
+        .encrypt(nonce, json_data.as_slice())
+        .map_err(|e| e.to_string())?;
+
+    let store = EncryptedStore {
+        salt: hex::encode(salt),
+        nonce: hex::encode(nonce_bytes),
+        data: hex::encode(encrypted_data),
+    };
+
+    let content = serde_json::to_string(&store).map_err(|e| e.to_string())?;
+    fs::write(path, content).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_contact(
+    app: AppHandle,
+    password: String,
+    name: String,
+    public_key: String,
+) -> Result<(), String> {
+    let path = get_contacts_path(&app);
+
+    let mut contacts = if path.exists() {
+        get_contacts(app.clone(), Some(password.clone()))?
     } else {
         vec![]
-    }
-}
+    };
 
-#[tauri::command]
-pub fn save_contact(app: AppHandle, name: String, public_key: String) -> Result<(), String> {
-    let path = get_contacts_path(&app);
-    let mut contacts = get_contacts(app.clone());
-    
-    // Evitar duplicados por nombre
     contacts.retain(|c| c.name != name);
     contacts.push(Contact { name, public_key });
-    
-    let content = serde_json::to_string(&contacts).map_err(|e| e.to_string())?;
-    fs::write(path, content).map_err(|e| e.to_string())?;
-    Ok(())
+
+    encrypt_and_save(path, &password, &contacts)
 }
 
 #[tauri::command]
-pub fn delete_contact(app: AppHandle, name: String) -> Result<(), String> {
+pub fn delete_contact(app: AppHandle, password: String, name: String) -> Result<(), String> {
     let path = get_contacts_path(&app);
-    let mut contacts = get_contacts(app.clone());
+    let mut contacts = get_contacts(app.clone(), Some(password.clone()))?;
     contacts.retain(|c| c.name != name);
-    
-    let content = serde_json::to_string(&contacts).map_err(|e| e.to_string())?;
-    fs::write(path, content).map_err(|e| e.to_string())?;
-    Ok(())
+    encrypt_and_save(path, &password, &contacts)
 }
