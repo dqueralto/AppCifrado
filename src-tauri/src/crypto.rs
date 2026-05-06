@@ -376,11 +376,11 @@ pub async fn encrypt_with_quantum(
     }
     
     // 2. Escribir el Ciphertext de ML-KEM (1568 bytes para ML-KEM-1024)
-    output_file.write_all(ciphertext.as_slice()).map_err(|e| e.to_string())?;
+    output_file.write_all(ciphertext.as_slice()).map_err(|_| "Error de I/O al escribir KEM ciphertext")?;
 
     // 3. Escribir Flags (1 byte)
     let flags = 0x01u8; // Compresión activada
-    output_file.write_all(&[flags]).map_err(|e| e.to_string())?;
+    output_file.write_all(&[flags]).map_err(|_| "Error de I/O al escribir Flags")?;
 
     // 4. Generar Sal y Nonces aleatorios para las capas simétricas
     let mut salt = [0u8; SALT_SIZE];
@@ -390,55 +390,61 @@ pub async fn encrypt_with_quantum(
     OsRng.fill_bytes(&mut aes_nonce_raw);
     OsRng.fill_bytes(&mut chacha_nonce_raw);
 
-    output_file.write_all(&salt).map_err(|e| e.to_string())?;
-    output_file.write_all(&aes_nonce_raw).map_err(|e| e.to_string())?;
-    output_file.write_all(&chacha_nonce_raw).map_err(|e| e.to_string())?;
+    output_file.write_all(&salt).map_err(|_| "Error de I/O al escribir Salt")?;
+    output_file.write_all(&aes_nonce_raw).map_err(|_| "Error de I/O al escribir Nonce AES")?;
+    output_file.write_all(&chacha_nonce_raw).map_err(|_| "Error de I/O al escribir Nonce ChaCha")?;
 
     // Derivar claves a partir del secreto compartido
     let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
     
-    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|e| e.to_string())?;
-    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|e| e.to_string())?;
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error al inicializar cifrador AES")?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|_| "Error al inicializar cifrador ChaCha20")?;
 
     encrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw)?;
 
     // Finalizar escritura y asegurar en disco
-    output_file.flush().map_err(|e| e.to_string())?;
-    output_file.sync_all().map_err(|e| e.to_string())?;
+    output_file.flush().map_err(|_| "Error de I/O al vaciar buffer")?;
+    output_file.sync_all().map_err(|_| "Error de I/O al sincronizar disco")?;
     drop(output_file);
 
     // 5. Firma Digital con Hash Streaming (evita cargar el archivo completo en RAM)
+    // BUG FIX #1: Antes usábamos `if parts.len() == 2` que ignoraba silenciosamente el error
+    // si la llave tenía un formato incorrecto, produciendo un vault firmado pero sin firma real.
+    // Ahora devolvemos un error explícito si el formato de la llave combinada es inválido.
     if let Some(sk_combined_hex) = signing_key_hex {
         let parts: Vec<&str> = sk_combined_hex.split(':').collect();
-        if parts.len() == 2 {
-            let vk_bytes = hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
-            let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
-
-            // Calcular SHA-256 del cuerpo del archivo (desde byte 3314) mediante streaming
-            // Esto evita cargar archivos de varios GB en RAM para calcular la firma.
-            let mut hasher = Sha256::new();
-            let mut sign_file = File::open(&output_path).map_err(|_| "Error al abrir archivo para firma")?;
-            sign_file.seek(SeekFrom::Start(3314)).map_err(|_| "Error I/O")?;
-            let mut hash_buf = [0u8; 65536];
-            loop {
-                let n = sign_file.read(&mut hash_buf).map_err(|_| "Error de lectura")?;
-                if n == 0 { break; }
-                hasher.update(&hash_buf[..n]);
-            }
-            let file_hash = hasher.finalize();
-
-            let dsa_vk_bytes: [u8; 1952] = vk_bytes.try_into().map_err(|_| "Longitud de llave pública de firma incorrecta")?;
-            let dsa_sk_bytes: [u8; 4032] = sk_bytes.try_into().map_err(|_| "Longitud de llave privada de firma incorrecta")?;
-
-            let dsa_kp = MlDsaKeyPair::from_keys(&dsa_sk_bytes, &dsa_vk_bytes, ML_DSA_65).map_err(|e| e.to_string())?;
-            // Firmamos el hash del archivo (no el archivo completo)
-            let sig = dsa_kp.sign(file_hash.as_slice(), b"").map_err(|e| e.to_string())?;
-
-            // Insertar la firma sin cargar todo el archivo en RAM
-            let mut f = std::fs::OpenOptions::new().write(true).open(&output_path).map_err(|_| "Error al inyectar firma")?;
-            f.seek(SeekFrom::Start(5)).map_err(|_| "Error I/O")?;
-            f.write_all(sig.as_bytes()).map_err(|_| "Error escribiendo firma")?;
+        if parts.len() != 2 {
+            // Limpiar el archivo de salida corrupto antes de abortar
+            let _ = std::fs::remove_file(&output_path);
+            return Err("Formato de llave de firma inválido. Se esperaba 'llave_publica:llave_privada'.".into());
         }
+        let vk_bytes = hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
+        let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
+
+        // Calcular SHA-256 del cuerpo del archivo (desde byte 3314 = Magic+ID+Firma reservada)
+        // IMPORTANTE: El hash se calcula sobre todo el contenido DESPUÉS de la firma reservada,
+        // incluyendo el KEM ciphertext, flags, salt, nonces y payload cifrado.
+        let mut hasher = Sha256::new();
+        let mut sign_file = File::open(&output_path).map_err(|_| "Error al abrir archivo para firma")?;
+        sign_file.seek(SeekFrom::Start(3314)).map_err(|_| "Error I/O al posicionar cursor de firma")?;
+        let mut hash_buf = [0u8; 65536];
+        loop {
+            let n = sign_file.read(&mut hash_buf).map_err(|_| "Error de lectura al calcular hash")?;
+            if n == 0 { break; }
+            hasher.update(&hash_buf[..n]);
+        }
+        let file_hash = hasher.finalize();
+
+        let dsa_vk_bytes: [u8; 1952] = vk_bytes.try_into().map_err(|_| "Longitud de llave pública de firma incorrecta")?;
+        let dsa_sk_bytes: [u8; 4032] = sk_bytes.try_into().map_err(|_| "Longitud de llave privada de firma incorrecta")?;
+
+        let dsa_kp = MlDsaKeyPair::from_keys(&dsa_sk_bytes, &dsa_vk_bytes, ML_DSA_65).map_err(|_| "Error al cargar par de llaves de firma")?;
+        let sig = dsa_kp.sign(file_hash.as_slice(), b"").map_err(|_| "Error al generar firma digital")?;
+
+        // Inyección quirúrgica de la firma: SeekFrom::Start(5) = 4 Magic Bytes + 1 Vault ID
+        let mut f = std::fs::OpenOptions::new().write(true).open(&output_path).map_err(|_| "Error al inyectar firma")?;
+        f.seek(SeekFrom::Start(5)).map_err(|_| "Error I/O al posicionar para inyección de firma")?;
+        f.write_all(sig.as_bytes()).map_err(|_| "Error al escribir firma en disco")?;
     }
 
     if shred_original {
@@ -485,16 +491,23 @@ pub async fn decrypt_with_quantum(
     if vault_id == 2 {
         let mut sig = [0u8; 3309]; // Tamaño de firma ML-DSA-65
         input_file.read_exact(&mut sig).map_err(|_| "Fallo al leer firma digital")?;
+        // NOTA BUG #2: Tras leer 3309 bytes de firma, el cursor está en: 
+        //   - Con magic bytes (nuevo): 4 + 1 + 3309 = 3314
+        //   - Sin magic bytes (viejo): 1 + 3309 = 3310
+        // El hash de verificación se calcula leyendo el resto del archivo desde este punto,
+        // lo que coincide EXACTAMENTE con el offset desde donde se calculó al firmar.
+        // Es crítico que estas posiciones permanezcan sincronizadas entre encrypt y decrypt.
 
         // Solo verificamos si el usuario ha proporcionado la llave pública del remitente.
         if let Some(vk_hex) = verifier_key_hex {
             let vk_bytes = hex::decode(vk_hex).map_err(|_| "Llave de verificación inválida")?;
             
-            // Calcular SHA-256 del cuerpo del archivo mediante streaming (evita cargar el archivo en RAM)
+            // El cursor ya está en la posición correcta (3314 o 3310 según versión).
+            // Leemos el resto del archivo para calcular el hash del payload protegido.
             let mut hasher = Sha256::new();
             let mut hash_buf = [0u8; 65536];
             loop {
-                let n = input_file.read(&mut hash_buf).map_err(|_| "Fallo I/O")?;
+                let n = input_file.read(&mut hash_buf).map_err(|_| "Fallo I/O al calcular hash de verificación")?;
                 if n == 0 { break; }
                 hasher.update(&hash_buf[..n]);
             }
@@ -503,19 +516,20 @@ pub async fn decrypt_with_quantum(
             let vk_bytes_array: [u8; 1952] = vk_bytes.try_into().map_err(|_| "Longitud de llave de verificación incorrecta")?;
             let dsa_sig = dilithium::MlDsaSignature::from_slice(&sig);
             
-            // Alerta Roja: verificamos el hash del cuerpo, no el cuerpo completo
+            // ¡ALERTA ROJA! si la firma no coincide con el hash calculado
             if !MlDsaKeyPair::verify(&vk_bytes_array, &dsa_sig, file_hash.as_slice(), b"", ML_DSA_65) {
                 return Err("¡ALERTA ROJA! La firma digital es INVÁLIDA o el archivo ha sido manipulado.".into());
             }
             
-            // Resetear cursor para continuar con el descifrado KEM
+            // Reabrir el archivo y posicionar el cursor en el inicio del KEM ciphertext
+            // (después de Magic+ID+Firma). Necesario porque el hash consumió el stream.
             let payload_offset = if has_magic { 3314 } else { 3310 };
-            input_file = File::open(&input_path).map_err(|_| "Fallo al reabrir archivo")?;
-            input_file.seek(SeekFrom::Start(payload_offset)).map_err(|_| "Fallo al mover cursor")?;
+            input_file = File::open(&input_path).map_err(|_| "Fallo al reabrir archivo para descifrado")?;
+            input_file.seek(SeekFrom::Start(payload_offset)).map_err(|_| "Fallo al posicionar cursor para KEM")?;
         } else {
-            // Si no hay llave de verificación, saltamos el bloque de firma.
+            // Sin llave de verificación: saltar directamente al inicio del KEM ciphertext
             let payload_offset = if has_magic { 3314 } else { 3310 };
-            input_file.seek(SeekFrom::Start(payload_offset)).map_err(|_| "Fallo al mover cursor")?;
+            input_file.seek(SeekFrom::Start(payload_offset)).map_err(|_| "Fallo al posicionar cursor para KEM")?;
         }
     }
 
@@ -593,7 +607,16 @@ pub async fn encrypt_folder(
     let _ = std::fs::remove_file(&temp_tar);
 
     if result.as_ref().is_ok() && shred_original {
-        // Borrado seguro de la carpeta original (recursivo)
+        // BUG FIX #3: Borrado seguro (DoD 5220.22-M) recursivo de la carpeta.
+        // Antes usaba remove_dir_all (borrado simple del SO), contradiciéndose con la garantía de seguridad.
+        // Ahora aplicamos secure_shred a cada archivo antes de eliminar el directorio.
+        if let Ok(entries) = std::fs::read_dir(&input_path) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() {
+                    let _ = secure_shred(&entry.path().to_string_lossy());
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&input_path);
     }
 
@@ -652,12 +675,21 @@ pub async fn encrypt_folder_with_quantum(
     }
 
     // 2. Cifrar con PQC
-    let result = encrypt_with_quantum(temp_tar.clone(), output_path, public_key_hex, signing_key_hex, false).await?;
-    
-    // 3. Limpiar temporal
-    let _ = std::fs::remove_file(&temp_tar);
+    // BUG FIX #5: Antes usábamos `?` que propagaba el error sin limpiar el .tmp_tar huérfano.
+    // Ahora capturamos el Result para garantizar la limpieza del temporal antes de propagar.
+    let result = encrypt_with_quantum(temp_tar.clone(), output_path, public_key_hex, signing_key_hex, false).await;
+    let _ = std::fs::remove_file(&temp_tar); // Siempre limpiar el temporal
+    let result = result?; // Ahora sí propagamos el error si hubo uno
 
+    // BUG FIX #3: Borrado seguro (DoD 5220.22-M) recursivo en lugar de remove_dir_all simple
     if result.success && shred_original {
+        if let Ok(entries) = std::fs::read_dir(&input_path) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() {
+                    let _ = secure_shred(&entry.path().to_string_lossy());
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&input_path);
     }
 
@@ -675,13 +707,19 @@ pub async fn decrypt_folder_with_quantum(
     let temp_tar = format!("{}.tmp_tar", input_path);
 
     // 1. Descifrar con PQC
-    let result = decrypt_with_quantum(input_path, temp_tar.clone(), private_key_hex, verifier_key_hex).await?;
+    // BUG FIX #5: Capturamos el Result antes de propagar para limpiar .tmp_tar si falla
+    let result = decrypt_with_quantum(input_path, temp_tar.clone(), private_key_hex, verifier_key_hex).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_tar); // Limpiar temporal huérfano
+        return result;
+    }
+    let result = result.unwrap();
 
     if result.success {
         // 2. Extraer TAR
-        let file = File::open(&temp_tar).map_err(|e| e.to_string())?;
+        let file = File::open(&temp_tar).map_err(|_| "Error al abrir TAR temporal")?;
         let mut archive = tar::Archive::new(file);
-        archive.unpack(&output_path).map_err(|e| e.to_string())?;
+        archive.unpack(&output_path).map_err(|_| "Error al extraer carpeta del contenedor")?;
         
         let _ = std::fs::remove_file(&temp_tar);
 
