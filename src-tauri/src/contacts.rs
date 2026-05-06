@@ -6,7 +6,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use argon2::Argon2;
+use argon2::{Argon2, Params};
 use rand::{RngCore, thread_rng};
 use std::sync::Mutex;
 use std::collections::HashMap;
@@ -78,7 +78,12 @@ fn get_contacts_path(app: &AppHandle) -> PathBuf {
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
-    let argon2 = Argon2::default();
+    let config = Params::new(65536, 3, 4, None).expect("Parámetros de Argon2 inválidos");
+    let argon2 = Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        config,
+    );
     let _ = argon2.hash_password_into(password.as_bytes(), salt, &mut key);
     key
 }

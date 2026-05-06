@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
@@ -74,9 +74,7 @@ export default function App() {
   const [copiedContact, setCopiedContact] = useState<string | null>(null); // Para feedback de copia
   const [copiedToast, setCopiedToast] = useState(false); // Toast de copiado en portapapeles
 
-  useEffect(() => {
-    loadContacts();
-  }, []);
+  // Eliminado el useEffect inicial de loadContacts ya que requiere contraseña y fallará silenciosamente
 
   const loadContacts = async (pass?: string) => {
     try {
@@ -342,6 +340,19 @@ export default function App() {
                 >
                   <Users className="w-3 h-3" /> Contactos
                 </button>
+                {identity && (
+                  <button
+                    onClick={() => {
+                      setIdentity(null);
+                      setQuantumKey("");
+                      setVerifierKey("");
+                    }}
+                    className="text-[10px] font-bold text-brand-emerald/80 uppercase tracking-tighter hover:text-red-400 transition-colors flex items-center gap-1"
+                    title="Cerrar Sesión Cuántica"
+                  >
+                    <Shield className="w-3 h-3" /> Salir (KEM)
+                  </button>
+                )}
               </div>
             </div>
           </div>

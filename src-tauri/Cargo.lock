@@ -2859,7 +2859,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
- "base64 0.22.1",
  "chacha20poly1305",
  "dilithium-rs",
  "flate2",
@@ -2877,7 +2876,6 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-opener",
  "tokio",
- "walkdir",
  "window-vibrancy",
 ]
 
@@ -4069,9 +4067,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

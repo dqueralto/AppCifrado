@@ -9,7 +9,7 @@ use argon2::{
 use rand::{rngs::OsRng, RngCore};
 use kem::{Decapsulate, Encapsulate};
 use ml_kem::{MlKem1024, KemCore, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey, kem::DecapsulationKey};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write, Seek, SeekFrom, BufReader, BufWriter};
 use dilithium::{MlDsaKeyPair, ML_DSA_65};
 use flate2::read::GzDecoder;
@@ -60,6 +60,14 @@ fn secure_shred(path: &str) -> std::io::Result<()> {
 
     // 3. Eliminar archivo
     std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Valida que la ruta no contenga intentos de directory traversal ni apunte a directorios sensibles.
+fn validate_path(path: &str) -> Result<(), String> {
+    if path.contains("..") {
+        return Err("Ruta no permitida: posible intento de directory traversal.".into());
+    }
     Ok(())
 }
 
@@ -190,6 +198,9 @@ pub async fn encrypt_file(
     password: String,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
+
     let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
     let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
 
@@ -235,6 +246,9 @@ pub async fn decrypt_file(
     output_path: String,
     password: String,
 ) -> Result<EncryptResponse, String> {
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
+
     let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
     let mut output_file = File::create(&output_path).map_err(|e| e.to_string())?;
 
@@ -297,6 +311,9 @@ pub async fn encrypt_with_quantum(
     signing_key_hex: Option<String>,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
+
     let pk_bytes = hex::decode(public_key_hex).map_err(|_| "Llave pública inválida")?;
     
     // Parsear la llave pública
@@ -389,10 +406,10 @@ pub async fn encrypt_with_quantum(
             // Firmamos el hash del archivo (no el archivo completo)
             let sig = dsa_kp.sign(file_hash.as_slice(), b"").map_err(|e| e.to_string())?;
 
-            // Leer el archivo completo para insertar la firma
-            let mut file_data = fs::read(&output_path).map_err(|e| e.to_string())?;
-            file_data[1..3310].copy_from_slice(sig.as_bytes());
-            fs::write(&output_path, file_data).map_err(|e| e.to_string())?;
+            // Insertar la firma sin cargar todo el archivo en RAM
+            let mut f = std::fs::OpenOptions::new().write(true).open(&output_path).map_err(|e| e.to_string())?;
+            f.seek(SeekFrom::Start(1)).map_err(|e| e.to_string())?;
+            f.write_all(sig.as_bytes()).map_err(|e| e.to_string())?;
         }
     }
 
@@ -414,6 +431,9 @@ pub async fn decrypt_with_quantum(
     private_key_hex: String,
     verifier_key_hex: Option<String>,
 ) -> Result<EncryptResponse, String> {
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
+
     let mut input_file = File::open(&input_path).map_err(|e| e.to_string())?;
     
     // --- PROTOCOLO DE DES-BLINDAJE CUÁNTICO ---
@@ -645,6 +665,10 @@ pub async fn hide_in_image(
     vault_path: String,
     output_path: String,
 ) -> Result<EncryptResponse, String> {
+    validate_path(&image_path)?;
+    validate_path(&vault_path)?;
+    validate_path(&output_path)?;
+
     let mut carrier_file = File::open(&image_path).map_err(|e| e.to_string())?;
     let mut vault_file = File::open(&vault_path).map_err(|e| e.to_string())?;
     let output_file = File::create(&output_path).map_err(|e| e.to_string())?;
@@ -674,15 +698,43 @@ pub async fn extract_from_image(
     image_path: String,
     output_vault_path: String,
 ) -> Result<EncryptResponse, String> {
+    validate_path(&image_path)?;
+    validate_path(&output_vault_path)?;
+
     let mut file = File::open(&image_path).map_err(|e| e.to_string())?;
     
     // Leemos el archivo en bloques para encontrar el marcador sin colapsar la RAM
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let marker_len = STEGO_MARKER.len();
+    let mut previous_tail = vec![];
+    let mut found_pos = None;
+    let mut current_offset = 0u64;
 
-    if let Some(pos) = buffer.windows(STEGO_MARKER.len()).position(|window| window == STEGO_MARKER) {
-        let vault_data = &buffer[pos + STEGO_MARKER.len()..];
-        fs::write(&output_vault_path, vault_data).map_err(|e| e.to_string())?;
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 { break; }
+
+        let mut search_buf = Vec::with_capacity(previous_tail.len() + count);
+        search_buf.extend_from_slice(&previous_tail);
+        search_buf.extend_from_slice(&buffer[..count]);
+
+        if let Some(pos) = search_buf.windows(marker_len).position(|window| window == STEGO_MARKER) {
+            let abs_pos = current_offset - (previous_tail.len() as u64) + (pos as u64) + (marker_len as u64);
+            found_pos = Some(abs_pos);
+            break;
+        }
+
+        current_offset += count as u64;
+        
+        let keep = std::cmp::min(search_buf.len(), marker_len - 1);
+        previous_tail.clear();
+        previous_tail.extend_from_slice(&search_buf[search_buf.len() - keep..]);
+    }
+
+    if let Some(pos) = found_pos {
+        file.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+        let mut out_file = File::create(&output_vault_path).map_err(|e| e.to_string())?;
+        io::copy(&mut file, &mut out_file).map_err(|e| e.to_string())?;
         
         Ok(EncryptResponse {
             success: true,
