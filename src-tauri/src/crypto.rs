@@ -17,6 +17,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Serialize, Deserialize)]
 pub struct EncryptResponse {
@@ -35,15 +36,30 @@ const CHUNK_SIZE: usize = 64 * 1024; // 64KB por bloque para optimizar RAM (Stre
 // Permite buscar el inicio del vault dentro de archivos multimedia (mkv, mp3, pdf).
 const STEGO_MARKER: &[u8] = b"CRYPTOBRO_HIDDEN_DATA_V1";
 
-/// Borrado seguro de un archivo sobrescribiéndolo con datos aleatorios
-/// Sobrescribe el contenido original con ruido aleatorio de OsRng antes de eliminarlo
-/// para prevenir la recuperación de datos mediante herramientas de forense digital.
+/// Borrado seguro de un archivo (DoD 5220.22-M: 3 pasadas)
 fn secure_shred(path: &str) -> std::io::Result<()> {
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len();
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
 
-    // 1. Sobrescribir con datos aleatorios
+    let mut write_pass = |data: &[u8]| -> std::io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut written = 0;
+        while written < size {
+            let to_write = std::cmp::min(data.len() as u64, size - written) as usize;
+            file.write_all(&data[..to_write])?;
+            written += to_write as u64;
+        }
+        file.sync_all()
+    };
+
+    // Pasada 1: Ceros
+    write_pass(&[0x00; 65536])?;
+    // Pasada 2: Unos
+    write_pass(&[0xFF; 65536])?;
+    
+    // Pasada 3: Ruido Aleatorio
+    file.seek(SeekFrom::Start(0))?;
     let mut random_data = vec![0u8; 65536];
     let mut written = 0;
     while written < size {
@@ -53,12 +69,10 @@ fn secure_shred(path: &str) -> std::io::Result<()> {
         written += to_write as u64;
     }
     file.sync_all()?;
+    random_data.zeroize();
 
-    // 2. Sobrescribir con ceros
     file.set_len(0)?;
     file.sync_all()?;
-
-    // 3. Eliminar archivo
     std::fs::remove_file(path)?;
     Ok(())
 }
@@ -85,9 +99,8 @@ fn derive_block_nonce(base_nonce: &[u8; 12], block_index: u64) -> [u8; 12] {
     nonce
 }
 
-/// Deriva claves simétricas a partir de una contraseña usando Argon2id
-pub fn derive_keys(password: &str, salt: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    // Configuración de Argon2id (Parámetros de grado militar)
+/// Deriva claves simétricas a partir de una contraseña usando Argon2id (Zeroized memory)
+pub fn derive_keys(password: &str, salt: &[u8]) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
     let config = Params::new(65536, 3, 4, None).expect("Parámetros de Argon2 inválidos");
 
     let argon2 = Argon2::new(
@@ -96,11 +109,13 @@ pub fn derive_keys(password: &str, salt: &[u8]) -> (Vec<u8>, Vec<u8>) {
         config,
     );
 
-    let mut output = [0u8; 64];
-    argon2.hash_password_into(password.as_bytes(), salt, &mut output).expect("Fallo al derivar claves");
+    let mut output = Zeroizing::new([0u8; 64]);
+    argon2.hash_password_into(password.as_bytes(), salt, output.as_mut()).expect("Fallo al derivar claves");
     
-    // Devolvemos dos claves de 32 bytes (una para AES y otra para ChaCha20)
-    (output[0..32].to_vec(), output[32..64].to_vec())
+    (
+        Zeroizing::new(output[0..32].to_vec()),
+        Zeroizing::new(output[32..64].to_vec())
+    )
 }
 
 /// Cifra un stream de datos en bloques con doble capa (AES-256-GCM + ChaCha20-Poly1305).
@@ -223,8 +238,8 @@ pub async fn encrypt_file(
     // Derivar claves a partir de la contraseña
     let (aes_key, chacha_key) = derive_keys(&password, &salt);
     
-    let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
-    let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|e| e.to_string())?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|e| e.to_string())?;
 
     encrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw)?;
 
@@ -268,8 +283,8 @@ pub async fn decrypt_file(
     // Re-derivar las mismas claves
     let (aes_key, chacha_key) = derive_keys(&password, &salt);
     
-    let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
-    let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|e| e.to_string())?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|e| e.to_string())?;
     let use_compression = (flags & 0x01) != 0;
 
     decrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw, use_compression)?;
@@ -369,8 +384,8 @@ pub async fn encrypt_with_quantum(
     // Derivar claves a partir del secreto compartido
     let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
     
-    let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
-    let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|e| e.to_string())?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|e| e.to_string())?;
 
     encrypt_blocks(&mut input_file, &mut output_file, &aes_cipher, &chacha_cipher, &aes_nonce_raw, &chacha_nonce_raw)?;
 
@@ -515,8 +530,8 @@ pub async fn decrypt_with_quantum(
     input_file.read_exact(&mut chacha_nonce_raw).map_err(|e| e.to_string())?;
 
     let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
-    let aes_cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
-    let chacha_cipher = ChaCha20Poly1305::new_from_slice(&chacha_key).map_err(|e| e.to_string())?;
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|e| e.to_string())?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|e| e.to_string())?;
     let use_compression = (flags & 0x01) != 0;
 
     let mut reader = BufReader::new(input_file);
