@@ -8,7 +8,7 @@ use argon2::{
 };
 use rand::{rngs::OsRng, RngCore};
 use kem::{Decapsulate, Encapsulate};
-use ml_kem::{MlKem1024, KemCore, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey, kem::DecapsulationKey, Ciphertext};
+use ml_kem::{MlKem1024, KemCore, EncodedSizeUser, MlKem1024Params, kem::EncapsulationKey, kem::DecapsulationKey};
 use std::fs::File;
 use std::io::{Read, Write};
 use serde::{Serialize, Deserialize};
@@ -270,8 +270,8 @@ pub async fn decrypt_with_quantum(
     let sk = DecapsulationKey::<MlKem1024Params>::from_bytes(sk_bytes_array.into());
 
     // Convertir el ciphertext en el tipo esperado por kem
-    let ct_bytes_array: &[u8; 1568] = kem_ciphertext.as_slice().try_into().map_err(|_| "Contenedor cuántico corrupto")?;
-    let ciphertext = *ml_kem::array::Array::from_slice(ct_bytes_array);
+    let ct_bytes_array: [u8; 1568] = kem_ciphertext.try_into().map_err(|_| "Contenedor cuántico corrupto")?;
+    let ciphertext = ml_kem::array::Array::from(ct_bytes_array);
 
     let shared_secret = sk.decapsulate(&ciphertext)
         .map_err(|_| "Fallo al descifrar el secreto cuántico. ¿Es la llave correcta?")?;

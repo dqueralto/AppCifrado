@@ -77,12 +77,14 @@ export default function App() {
       
       if (mode === 'encrypt') {
         outputPath = await save({
+          title: "Guardar contenedor seguro",
           defaultPath: inputPath + ".vault",
           filters: [{ name: 'Bóveda Cuántica', extensions: ['vault'] }]
         });
       } else {
         const defaultName = inputPath.replace(".vault", "");
         outputPath = await save({
+          title: "Guardar archivo descifrado",
           defaultPath: defaultName,
         });
       }
