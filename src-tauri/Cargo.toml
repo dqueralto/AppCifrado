@@ -30,7 +30,9 @@ base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 window-vibrancy = "0.6"
+flate2 = "1.0"
 tar = "0.4"
 walkdir = "2"
 kem = "0.3.0-pre.0"
+dilithium-rs = "0.2.0"
 

@@ -1,6 +1,14 @@
 mod crypto;
+mod contacts;
 
-use crypto::{encrypt_file, decrypt_file, generate_quantum_keys, encrypt_folder, decrypt_folder, encrypt_with_quantum, decrypt_with_quantum};
+use crypto::{
+    encrypt_file, decrypt_file, generate_quantum_keys, 
+    encrypt_folder, decrypt_folder, 
+    encrypt_with_quantum, decrypt_with_quantum,
+    encrypt_folder_with_quantum, decrypt_folder_with_quantum,
+    hide_in_image, extract_from_image
+};
+use contacts::{get_contacts, save_contact, delete_contact};
 use tauri::Manager;
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
@@ -26,7 +34,14 @@ pub fn run() {
             encrypt_folder,
             decrypt_folder,
             encrypt_with_quantum,
-            decrypt_with_quantum
+            decrypt_with_quantum,
+            encrypt_folder_with_quantum,
+            decrypt_folder_with_quantum,
+            hide_in_image,
+            extract_from_image,
+            get_contacts,
+            save_contact,
+            delete_contact
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

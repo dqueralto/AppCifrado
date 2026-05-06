@@ -802,6 +802,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dilithium-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b0aa9ae3a1b700e0ac9f707cdff5c3893f4f11a3b1b317c5113a422ef785809"
+dependencies = [
+ "getrandom 0.2.17",
+ "sha2",
+ "sha3",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2848,6 +2861,8 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "chacha20poly1305",
+ "dilithium-rs",
+ "flate2",
  "hex",
  "kem",
  "ml-kem",
