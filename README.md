@@ -44,18 +44,20 @@ A diferencia de una base de datos relacional, el "Modelo de Datos" de CryptoBro 
 ### Contenedor Estándar (Contraseña)
 | Desplazamiento | Longitud | Descripción |
 | :--- | :--- | :--- |
-| `0x00` | 1 byte | Flags (Bit 0: Compresión Gzip activada). |
-| `0x01` | 16 bytes | Sal aleatoria (Salt) para Argon2id. |
-| `0x11` | 12 bytes | Nonce base para AES-256-GCM. |
-| `0x1D` | 12 bytes | Nonce base para ChaCha20-Poly1305. |
-| `0x29` | Variable | Bloques de datos cifrados (Tamaño + Payload). |
+| `0x00` | 4 bytes | Magic Bytes (`CBRO`). Verificación estructural instantánea. |
+| `0x04` | 1 byte | Flags (Bit 0: Compresión Gzip activada). |
+| `0x05` | 16 bytes | Sal aleatoria (Salt) para Argon2id. |
+| `0x15` | 12 bytes | Nonce base para AES-256-GCM. |
+| `0x21` | 12 bytes | Nonce base para ChaCha20-Poly1305. |
+| `0x2D` | Variable | Bloques de datos cifrados (Tamaño + Payload). |
 
 ### Contenedor Cuántico (ML-KEM + ML-DSA)
 | Desplazamiento | Longitud | Descripción |
 | :--- | :--- | :--- |
-| `0x00` | 1 byte | Vault ID (`1` = KEM, `2` = KEM + Firma Digital). |
-| `0x01` | 3309 bytes | (Solo si ID = 2) Firma ML-DSA-65. |
-| `0xCEE`| 1568 bytes | Ciphertext encapsulado de ML-KEM-1024. |
+| `0x00` | 4 bytes | Magic Bytes (`CBRO`). |
+| `0x04` | 1 byte | Vault ID (`1` = KEM, `2` = KEM + Firma Digital). |
+| `0x05` | 3309 bytes | (Solo si ID = 2) Firma ML-DSA-65. |
+| `0xCF2`| 1568 bytes | Ciphertext encapsulado de ML-KEM-1024. |
 | `...`  | Variable | Flags, Sal, Nonces y Payload cifrado (igual al Estándar). |
 
 ---
@@ -69,6 +71,8 @@ El sistema ha superado estrictas auditorías técnicas para mitigar ataques cono
 3. **Seguridad contra Fuerza Bruta**: La libreta de contactos (`contacts.vault`) implementa un limitador local (máximo 5 intentos seguidos) respaldado por un `Mutex<HashMap>` global en Rust, con un bloqueo forzado de 30 segundos. Además, Argon2id utiliza configuración de grado militar (`m=65536, t=3, p=4`).
 4. **Protección en Memoria**: La llave privada cuántica jamás se escribe en disco. Permanece en el estado de React solo durante su uso. Un botón "Salir (KEM)" permite al usuario limpiar la memoria de inmediato (Zeroización de contexto frontend). Además, en el backend Rust, las llaves simétricas temporales se sobrescriben con ceros usando el trait `Zeroize` antes de liberar la RAM.
 5. **Borrado Seguro (Secure Shredding)**: Implementa el estándar **DoD 5220.22-M** del Departamento de Defensa. Cuando el usuario decide destruir el archivo original, CryptoBro no lo borra simplemente; lo sobrescribe mediante 3 pasadas exhaustivas (Ceros `0x00`, Unos `0xFF` y Ruido criptográfico de `OsRng`) antes de desvincularlo del disco duro, haciendo imposible su recuperación forense.
+6. **Política de Seguridad de Contenido (CSP)**: El frontend opera bajo un CSP estricto (`default-src 'self'`) que bloquea inyecciones de código remoto (XSS), haciendo imposible la exfiltración de llaves cuánticas a través de internet incluso si el sistema está comprometido.
+7. **Anti-Fuga de Datos (Sanitización)**: Los errores del sistema operativo no se propagan a la capa visual para prevenir la filtración de la estructura del árbol de directorios del equipo.
 
 ---
 
