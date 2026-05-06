@@ -11,7 +11,6 @@ import {
   Activity,
   CheckCircle2,
   XCircle,
-  FileCheck,
   ShieldAlert,
   Fingerprint,
   Zap,
