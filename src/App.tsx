@@ -100,7 +100,7 @@ export default function App() {
       setContacts(list);
       setIsContactsUnlocked(true);
     } catch (err) {
-      setProcessState({ status: 'error', message: "Contraseña de contactos incorrecta o error de acceso" });
+      setProcessState({ status: 'error', message: String(err) });
       setIsContactsUnlocked(false);
       setContacts([]);
     }
@@ -337,13 +337,16 @@ export default function App() {
       if (result.success) {
         setProcessState({ status: 'success', message: result.message });
         setInputPath("");
-        setPassword("");
-        setQuantumKey("");
       } else {
         setProcessState({ status: 'error', message: "Operación fallida" });
       }
     } catch (err: any) {
       setProcessState({ status: 'error', message: err.toString() });
+    } finally {
+      // Defensa de Estado: Destrucción de secretos del DOM / V8 Memory
+      setPassword("");
+      setQuantumKey("");
+      setVerifierKey("");
     }
   };
 

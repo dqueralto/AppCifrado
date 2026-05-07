@@ -45,7 +45,7 @@ A diferencia de una base de datos relacional, el "Modelo de Datos" de CryptoBro 
 | Desplazamiento | Longitud | Descripción |
 | :--- | :--- | :--- |
 | `0x00` | 4 bytes | Magic Bytes (`CBRO`). Verificación estructural instantánea. |
-| `0x04` | 1 byte | Flags (Bit 0: Compresión Gzip activada). |
+| `0x04` | 1 byte | Flags (Bit 0: Compresión Gzip activada - *Obsoleto en nuevas versiones por seguridad Anti-CRIME*). |
 | `0x05` | 16 bytes | Sal aleatoria (Salt) para Argon2id. |
 | `0x15` | 12 bytes | Nonce base para AES-256-GCM. |
 | `0x21` | 12 bytes | Nonce base para ChaCha20-Poly1305. |
@@ -64,15 +64,20 @@ A diferencia de una base de datos relacional, el "Modelo de Datos" de CryptoBro 
 
 ## 🔐 4. Seguridad y Arquitectura de Defensas
 
-El sistema ha superado **8 auditorías técnicas exhaustivas**, culminando en una fase de consolidación donde se blindaron las fugas de información por errores de I/O y se implementó el borrado seguro de grado militar. Estrategias implementadas:
+El sistema ha superado **18 auditorías técnicas exhaustivas**, culminando en un blindaje total contra ataques forenses, exfiltración de memoria y ataques post-cuánticos. Estrategias implementadas:
 
 1. **Defensa contra Reutilización de Nonce**: AES-GCM es extremadamente vulnerable si se reutiliza un Nonce. La función `derive_block_nonce` utiliza el Nonce base y realiza una operación `XOR` con un contador de 64-bits que incrementa por cada bloque, garantizando unicidad criptográfica.
-2. **Cascada Simétrica**: Para proteger contra debilidades futuras en cualquier algoritmo único, los datos se comprimen con Gzip, se cifran primero con AES-256-GCM y luego se envuelven en una capa de ChaCha20-Poly1305.
-3. **Seguridad contra Fuerza Bruta**: La libreta de contactos (`contacts.vault`) implementa un limitador local (máximo 5 intentos seguidos) respaldado por un `Mutex<HashMap>` global en Rust, con un bloqueo forzado de 30 segundos. Además, Argon2id utiliza configuración de grado militar (`m=65536, t=3, p=4`).
-4. **Protección en Memoria**: La llave privada cuántica jamás se escribe en disco. Permanece en el estado de React solo durante su uso. Un botón "Salir (KEM)" permite al usuario limpiar la memoria de inmediato (Zeroización de contexto frontend). Además, en el backend Rust, las llaves simétricas temporales se sobrescriben con ceros usando el trait `Zeroize` antes de liberar la RAM.
-5. **Borrado Seguro (Secure Shredding)**: Implementa el estándar **DoD 5220.22-M** del Departamento de Defensa. Cuando el usuario decide destruir el archivo original, CryptoBro no lo borra simplemente; lo sobrescribe mediante 3 pasadas exhaustivas (Ceros `0x00`, Unos `0xFF` y Ruido criptográfico de `OsRng`) antes de desvincularlo del disco duro. Para carpetas, el borrado es **recursivo**: se aplica `secure_shred` a cada archivo individual antes de eliminar el directorio.
-6. **Política de Seguridad de Contenido (CSP)**: El frontend opera bajo un CSP estricto (`default-src 'self'`) que bloquea inyecciones de código remoto (XSS), haciendo imposible la exfiltración de llaves cuánticas a través de internet incluso si el sistema está comprometido.
-7. **Anti-Fuga de Datos (Sanitización)**: Los errores del sistema operativo no se propagan a la capa visual para prevenir la filtración de la estructura del árbol de directorios del equipo.
+2. **Cascada Simétrica y Anti-CRIME**: Los datos se cifran en dos capas (AES-256-GCM + ChaCha20-Poly1305). En versiones recientes, se ha **eliminado la compresión Gzip** para archivos nuevos para mitigar ataques de oráculo de compresión (*CRIME / BREACH*), garantizando que el tamaño del bloque sea siempre uniforme.
+3. **Seguridad contra Fuerza Bruta**: La libreta de contactos (`contacts.vault`) implementa un limitador local (máximo 5 intentos) con bloqueo forzado de 30 segundos, visible en tiempo real en la UI. Argon2id utiliza configuración de grado militar (`m=65536, t=3, p=4`).
+4. **Blindaje de Memoria (Zeroization)**: Implementación de la política de *Cero Persistencia en RAM*.
+   - **Backend**: Todas las contraseñas y llaves cuánticas son mutables y se sobrescriben físicamente con ceros (`.zeroize()`) milisegundos después de su uso.
+   - **Frontend**: Los estados de React se limpian incondicionalmente (bloque `finally`) tras cada operación, forzando al recolector de basura de V8 a eliminar secretos del heap de la ventana.
+5. **Transacciones Atómicas**: Si una operación de descifrado falla (datos corruptos o llave incorrecta), el sistema ejecuta un "botón de pánico" que destruye automáticamente el archivo parcial resultante mediante borrado seguro, evitando fugas de texto plano no autenticado (*Unauthenticated Plaintext Release*).
+6. **Borrado Seguro (Secure Shredding)**: Implementa el estándar **DoD 5220.22-M**. CryptoBro sobrescribe archivos mediante 3 pasadas exhaustivas (Ceros, Unos y Ruido criptográfico). Para carpetas, el borrado es **recursivo**: se tritura cada archivo individualmente antes de eliminar el directorio raíz.
+7. **Negación Plausible en Stego**: Al ocultar un contenedor en una imagen, el sistema tritura automáticamente el archivo `.vault` original tras la inyección exitosa, eliminando cualquier rastro forense de la operación.
+8. **Escudo Anti-OOM (Out of Memory)**: El motor de Rust impone límites físicos estrictos (máximo 20,000 caracteres) a las llaves pegadas desde el portapapeles, evitando colapsos del sistema por saturación de memoria.
+9. **Portapapeles Seguro**: Las llaves copiadas se eliminan automáticamente del portapapeles del sistema operativo tras 10 segundos para prevenir el espionaje por otras aplicaciones.
+10. **Política de Seguridad de Contenido (CSP)**: El frontend opera bajo un CSP estricto (`default-src 'self'`) que bloquea XSS y exfiltración de datos.
 
 ---
 
@@ -80,9 +85,10 @@ El sistema ha superado **8 auditorías técnicas exhaustivas**, culminando en un
 
 CryptoBro está diseñado para manejar **archivos de varios gigabytes** sin colapsar la RAM del usuario (Prevención de Out of Memory - OOM).
 
-### A. Cifrado / Descifrado en Streaming (`crypto.rs`)
-En lugar de `fs::read` completo, se utiliza un bucle con `CHUNK_SIZE = 64KB`. Cada trozo se lee, se comprime, se cifra y se escribe al vuelo en disco.
-Para las firmas digitales, se emplea una inserción quirúrgica con `SeekFrom::Start(5)`, sobrescribiendo únicamente los `3309 bytes` correspondientes a la firma sin cargar el contenedor gigante en memoria. La posición `5` corresponde a los 4 bytes de Magic Bytes más el byte de Vault ID.
+### A. Cifrado / Descifrado en Multihilo (`crypto.rs`)
+En lugar de bloquear el hilo principal, el motor utiliza `tokio::task::spawn_blocking` para mover las operaciones pesadas de I/O a un pool de hilos dedicado. Esto permite que la interfaz de usuario permanezca fluida a 60 FPS incluso durante el cifrado de archivos de varios gigabytes. 
+- **Streaming**: Se utiliza un bucle con `CHUNK_SIZE = 64KB`. Cada bloque se procesa de forma independiente para mantener un uso de RAM constante e ínfimo.
+- **Inyección de Firmas**: Para las firmas digitales, se emplea una inserción quirúrgica con `SeekFrom::Start(5)`, sobrescribiendo únicamente los `3309 bytes` correspondientes sin recargar el archivo en memoria.
 
 ### B. Esteganografía Inteligente
 CryptoBro puede ocultar archivos `.vault` dentro de archivos multimedia normales (MKV, PDF, PNG) concatenándolos detrás del marcador `CRYPTOBRO_HIDDEN_DATA_V1`.

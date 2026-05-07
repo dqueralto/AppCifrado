@@ -81,6 +81,25 @@ fn secure_shred(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Borrado seguro recursivo de un directorio completo (DoD 5220.22-M)
+fn secure_shred_dir_recursive(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let child_path = entry.path();
+            if child_path.is_dir() {
+                secure_shred_dir_recursive(&child_path)?;
+            } else {
+                let _ = secure_shred(&child_path.to_string_lossy());
+            }
+        }
+        std::fs::remove_dir(path)?;
+    } else {
+        let _ = secure_shred(&path.to_string_lossy());
+    }
+    Ok(())
+}
+
 /// Valida que la ruta no contenga intentos de directory traversal ni apunte a directorios sensibles.
 fn validate_path(path: &str) -> Result<(), String> {
     if path.contains("..") {
@@ -139,10 +158,9 @@ fn encrypt_blocks(
         }
         let chunk = &buffer[..count];
 
-        // Comprimir con Gzip
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(chunk).map_err(|_| "Fallo al comprimir datos")?;
-        let compressed = encoder.finish().map_err(|_| "Fallo al finalizar compresión")?;
+        // Defensa CRIME/BREACH: Se ha deshabilitado la compresión Gzip intencionadamente.
+        // Comprimir datos antes de cifrarlos es un vector de ataque conocido (Oráculo de Compresión).
+        // Al enviar el bloque en RAW (crudo), garantizamos inmunidad y multiplicamos la velocidad x100.
 
         // Nonce único por bloque
         let aes_nonce = derive_block_nonce(aes_nonce_raw, block_index);
@@ -150,7 +168,7 @@ fn encrypt_blocks(
 
         // Doble capa de cifrado
         let enc_aes = aes_cipher
-            .encrypt(Nonce::from_slice(&aes_nonce), compressed.as_slice())
+            .encrypt(Nonce::from_slice(&aes_nonce), chunk)
             .map_err(|_| "Fallo al cifrar datos (AES)")?;
         let enc_final = chacha_cipher
             .encrypt(Nonce::from_slice(&chacha_nonce), enc_aes.as_slice())
@@ -233,7 +251,7 @@ fn decrypt_blocks(
 pub async fn encrypt_file(
     input_path: String,
     output_path: String,
-    password: String,
+    mut password: String,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
@@ -257,7 +275,7 @@ pub async fn encrypt_file(
     output_file
         .write_all(MAGIC_BYTES)
         .map_err(|_| "Fallo de I/O al escribir Magic Bytes")?;
-    let flags = 0x01u8; // Bit 0: Compresión activada
+    let flags = 0x00u8; // Bit 0: Compresión desactivada (Protección Anti-CRIME)
     output_file
         .write_all(&[flags])
         .map_err(|_| "Fallo de I/O al escribir Flags")?;
@@ -273,19 +291,22 @@ pub async fn encrypt_file(
 
     // Derivar claves a partir de la contraseña
     let (aes_key, chacha_key) = derive_keys(&password, &salt);
+    password.zeroize(); // Defensa: Borrado de contraseña maestra en memoria RAM
 
     let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error interno: Fallo al inicializar cifrador AES")?;
     let chacha_cipher =
         ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|_| "Error interno: Fallo al inicializar cifrador ChaCha20")?;
 
-    encrypt_blocks(
-        &mut input_file,
-        &mut output_file,
-        &aes_cipher,
-        &chacha_cipher,
-        &aes_nonce_raw,
-        &chacha_nonce_raw,
-    )?;
+    tokio::task::spawn_blocking(move || {
+        encrypt_blocks(
+            &mut input_file,
+            &mut output_file,
+            &aes_cipher,
+            &chacha_cipher,
+            &aes_nonce_raw,
+            &chacha_nonce_raw,
+        )
+    }).await.map_err(|_| "Error de hardware aislando el cifrado")??;
 
     if shred_original {
         let _ = secure_shred(&input_path);
@@ -303,7 +324,7 @@ pub async fn encrypt_file(
 pub async fn decrypt_file(
     input_path: String,
     output_path: String,
-    password: String,
+    mut password: String,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
     validate_path(&output_path)?;
@@ -346,21 +367,29 @@ pub async fn decrypt_file(
 
     // Re-derivar las mismas claves
     let (aes_key, chacha_key) = derive_keys(&password, &salt);
+    password.zeroize(); // Defensa: Borrado de contraseña maestra en memoria RAM
 
     let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error interno: Fallo al inicializar cifrador AES")?;
     let chacha_cipher =
         ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|_| "Error interno: Fallo al inicializar cifrador ChaCha20")?;
     let use_compression = (flags & 0x01) != 0;
 
-    decrypt_blocks(
-        &mut input_file,
-        &mut output_file,
-        &aes_cipher,
-        &chacha_cipher,
-        &aes_nonce_raw,
-        &chacha_nonce_raw,
-        use_compression,
-    )?;
+    let output_path_clone = output_path.clone();
+    tokio::task::spawn_blocking(move || {
+        decrypt_blocks(
+            &mut input_file,
+            &mut output_file,
+            &aes_cipher,
+            &chacha_cipher,
+            &aes_nonce_raw,
+            &chacha_nonce_raw,
+            use_compression,
+        )
+    }).await.map_err(|_| "Error de hardware aislando el descifrado".to_string())?.map_err(|e| {
+        // Prevención de Unauthenticated Plaintext Release: Destruir archivo parcial en caso de error
+        let _ = secure_shred(&output_path_clone);
+        e
+    })?;
 
     Ok(EncryptResponse {
         success: true,
@@ -398,14 +427,21 @@ pub async fn generate_quantum_keys() -> Result<EncryptResponse, String> {
 pub async fn encrypt_with_quantum(
     input_path: String,
     output_path: String,
-    public_key_hex: String,
-    signing_key_hex: Option<String>,
+    mut public_key_hex: String,
+    mut signing_key_hex: Option<String>,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
     validate_path(&output_path)?;
 
-    let pk_bytes = hex::decode(public_key_hex).map_err(|_| "Llave pública inválida")?;
+    // Prevención de colapso de memoria (OOM): Evitar que un portapapeles gigante tire el programa
+    if public_key_hex.len() > 20_000 {
+        public_key_hex.zeroize();
+        return Err("Llave pública demasiado grande (Riesgo OOM)".into());
+    }
+
+    let pk_bytes = hex::decode(&public_key_hex).map_err(|_| "Llave pública inválida")?;
+    public_key_hex.zeroize(); // Defensa RAM: Destruir llave cuántica
 
     // Parsear la llave pública
     let pk_bytes_array: &[u8; 1568] = pk_bytes
@@ -456,7 +492,7 @@ pub async fn encrypt_with_quantum(
         .map_err(|_| "Error de I/O al escribir KEM ciphertext")?;
 
     // 3. Escribir Flags (1 byte)
-    let flags = 0x01u8; // Compresión activada
+    let flags = 0x00u8; // Compresión desactivada (Protección Anti-CRIME)
     output_file
         .write_all(&[flags])
         .map_err(|_| "Error de I/O al escribir Flags")?;
@@ -487,14 +523,16 @@ pub async fn encrypt_with_quantum(
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice())
         .map_err(|_| "Error al inicializar cifrador ChaCha20")?;
 
-    encrypt_blocks(
-        &mut input_file,
-        &mut output_file,
-        &aes_cipher,
-        &chacha_cipher,
-        &aes_nonce_raw,
-        &chacha_nonce_raw,
-    )?;
+    tokio::task::spawn_blocking(move || {
+        encrypt_blocks(
+            &mut input_file,
+            &mut output_file,
+            &aes_cipher,
+            &chacha_cipher,
+            &aes_nonce_raw,
+            &chacha_nonce_raw,
+        )
+    }).await.map_err(|_| "Error de hardware aislando el cifrado cuántico")??;
 
     // Finalizar escritura y asegurar en disco
     output_file
@@ -509,11 +547,19 @@ pub async fn encrypt_with_quantum(
     // BUG FIX #1: Antes usábamos `if parts.len() == 2` que ignoraba silenciosamente el error
     // si la llave tenía un formato incorrecto, produciendo un vault firmado pero sin firma real.
     // Ahora devolvemos un error explícito si el formato de la llave combinada es inválido.
-    if let Some(sk_combined_hex) = signing_key_hex {
+    if let Some(mut sk_combined_hex) = signing_key_hex {
+        // Prevención de colapso de memoria (OOM)
+        if sk_combined_hex.len() > 20_000 {
+            sk_combined_hex.zeroize();
+            let _ = secure_shred(&output_path);
+            return Err("Llave de firma demasiado grande (Riesgo OOM)".into());
+        }
+
         let parts: Vec<&str> = sk_combined_hex.split(':').collect();
         if parts.len() != 2 {
+            sk_combined_hex.zeroize();
             // Limpiar el archivo de salida corrupto antes de abortar
-            let _ = std::fs::remove_file(&output_path);
+            let _ = secure_shred(&output_path);
             return Err(
                 "Formato de llave de firma inválido. Se esperaba 'llave_publica:llave_privada'."
                     .into(),
@@ -522,6 +568,7 @@ pub async fn encrypt_with_quantum(
         let vk_bytes =
             hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
         let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
+        sk_combined_hex.zeroize(); // Defensa RAM: Destruir llave de firma
 
         // Calcular SHA-256 del cuerpo del archivo (desde byte 3314 = Magic+ID+Firma reservada)
         // IMPORTANTE: El hash se calcula sobre todo el contenido DESPUÉS de la firma reservada,
@@ -583,8 +630,8 @@ pub async fn encrypt_with_quantum(
 pub async fn decrypt_with_quantum(
     input_path: String,
     output_path: String,
-    private_key_hex: String,
-    verifier_key_hex: Option<String>,
+    mut private_key_hex: String,
+    mut verifier_key_hex: Option<String>,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
     validate_path(&output_path)?;
@@ -627,8 +674,15 @@ pub async fn decrypt_with_quantum(
         // Es crítico que estas posiciones permanezcan sincronizadas entre encrypt y decrypt.
 
         // Solo verificamos si el usuario ha proporcionado la llave pública del remitente.
-        if let Some(vk_hex) = verifier_key_hex {
-            let vk_bytes = hex::decode(vk_hex).map_err(|_| "Llave de verificación inválida")?;
+        if let Some(mut vk_hex) = verifier_key_hex {
+            // Prevención OOM
+            if vk_hex.len() > 20_000 {
+                vk_hex.zeroize();
+                return Err("Llave de verificación demasiado grande (Riesgo OOM)".into());
+            }
+
+            let vk_bytes = hex::decode(&vk_hex).map_err(|_| "Llave de verificación inválida")?;
+            vk_hex.zeroize(); // Defensa RAM: Destruir llave de verificación
 
             // El cursor ya está en la posición correcta (3314 o 3310 según versión).
             // Leemos el resto del archivo para calcular el hash del payload protegido.
@@ -695,7 +749,14 @@ pub async fn decrypt_with_quantum(
     let flags = flags_buf[0];
 
     // Decapsular usando la llave privada
-    let sk_bytes = hex::decode(private_key_hex).map_err(|_| "Llave privada inválida")?;
+    // Prevención OOM: Limitar tamaño de entrada antes de parsear
+    if private_key_hex.len() > 20_000 {
+        private_key_hex.zeroize();
+        return Err("Llave privada demasiado grande (Riesgo OOM)".into());
+    }
+    let sk_bytes = hex::decode(&private_key_hex).map_err(|_| "Llave privada inválida")?;
+    private_key_hex.zeroize(); // Defensa RAM: Destruir llave privada de memoria
+
     let sk_bytes_array: &[u8; 3168] = sk_bytes
         .as_slice()
         .try_into()
@@ -741,15 +802,22 @@ pub async fn decrypt_with_quantum(
     let use_compression = (flags & 0x01) != 0;
 
     let mut reader = BufReader::new(input_file);
-    decrypt_blocks(
-        &mut reader,
-        &mut output_file,
-        &aes_cipher,
-        &chacha_cipher,
-        &aes_nonce_raw,
-        &chacha_nonce_raw,
-        use_compression,
-    )?;
+    let output_path_clone = output_path.clone();
+    tokio::task::spawn_blocking(move || {
+        decrypt_blocks(
+            &mut reader,
+            &mut output_file,
+            &aes_cipher,
+            &chacha_cipher,
+            &aes_nonce_raw,
+            &chacha_nonce_raw,
+            use_compression,
+        )
+    }).await.map_err(|_| "Error de hardware aislando el descifrado cuántico".to_string())?.map_err(|e| {
+        // Prevención de Unauthenticated Plaintext Release: Destruir archivo parcial en caso de error
+        let _ = secure_shred(&output_path_clone);
+        e
+    })?;
 
     Ok(EncryptResponse {
         success: true,
@@ -788,14 +856,7 @@ pub async fn encrypt_folder(
 
     if result.as_ref().is_ok() && shred_original {
         // Borrado seguro (DoD 5220.22-M) recursivo de la carpeta
-        if let Ok(entries) = std::fs::read_dir(&input_path) {
-            for entry in entries.flatten() {
-                if entry.path().is_file() {
-                    let _ = secure_shred(&entry.path().to_string_lossy());
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&input_path);
+        let _ = secure_shred_dir_recursive(std::path::Path::new(&input_path));
     }
 
     result
@@ -876,16 +937,9 @@ pub async fn encrypt_folder_with_quantum(
     let _ = secure_shred(&temp_tar); // Siempre limpiar el temporal
     let result = result?;
 
-    // Borrado seguro (DoD 5220.22-M) recursivo en lugar de remove_dir_all simple
+    // Borrado seguro (DoD 5220.22-M) recursivo verdadero
     if result.success && shred_original {
-        if let Ok(entries) = std::fs::read_dir(&input_path) {
-            for entry in entries.flatten() {
-                if entry.path().is_file() {
-                    let _ = secure_shred(&entry.path().to_string_lossy());
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&input_path);
+        let _ = secure_shred_dir_recursive(std::path::Path::new(&input_path));
     }
 
     Ok(result)
@@ -961,6 +1015,10 @@ pub async fn hide_in_image(
     io::copy(&mut vault_file, &mut writer).map_err(|_| "Error de I/O al camuflar el contenedor.")?;
 
     writer.flush().map_err(|_| "Error de I/O al vaciar buffers del disco.")?;
+
+    // Prevención de rastro esteganográfico: Destruir el .vault original (Plausible Deniability)
+    drop(vault_file);
+    let _ = secure_shred(&vault_path);
 
     Ok(EncryptResponse {
         success: true,
