@@ -14,8 +14,8 @@
     "windows": [
       {
         "title": "",
-        "width": 850,
-        "height": 850,
+        "width": 1150,
+        "height": 750,
         "transparent": true,
         "decorations": true,
         "titleBarStyle": "Overlay"
