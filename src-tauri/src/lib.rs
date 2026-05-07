@@ -36,10 +36,10 @@ pub fn run() {
                     height: height as u32,
                 }));
 
-                // Centrar horizontal y verticalmente al inicio
+                // Centrar horizontalmente pero pegar al margen superior (y: 0)
                 let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
                     x: ((size.width as f64 - width) / 2.0) as i32,
-                    y: ((size.height as f64 - height) / 2.0) as i32,
+                    y: 0,
                 }));
             }
 
