@@ -455,7 +455,7 @@ export default function App() {
                     <Key className="w-3 h-3" /> Contraseña
                   </button>
                   <button
-                    onClick={() => { setCryptoMethod('quantum'); setItemType('file'); setInputPath(""); }}
+                    onClick={() => { setCryptoMethod('quantum'); setInputPath(""); }}
                     className={cn(
                       "text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg border transition-all flex items-center gap-2",
                       cryptoMethod === 'quantum' ? "border-brand-cyan/50 text-brand-cyan bg-brand-cyan/5" : "border-white/5 text-white/20 hover:text-white/40"
