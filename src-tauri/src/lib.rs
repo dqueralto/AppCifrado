@@ -10,7 +10,7 @@ use crypto::{
 };
 use contacts::{get_contacts, save_contact, delete_contact};
 use tauri::Manager;
-use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
