@@ -1,20 +1,18 @@
-mod crypto;
 mod contacts;
+mod crypto;
 
+use contacts::{delete_contact, get_contacts, save_contact};
 use crypto::{
-    encrypt_file, decrypt_file, generate_quantum_keys, 
-    encrypt_folder, decrypt_folder, 
-    encrypt_with_quantum, decrypt_with_quantum,
-    encrypt_folder_with_quantum, decrypt_folder_with_quantum,
-    hide_in_image, extract_from_image
+    decrypt_file, decrypt_folder, decrypt_folder_with_quantum, decrypt_with_quantum, encrypt_file,
+    encrypt_folder, encrypt_folder_with_quantum, encrypt_with_quantum, extract_from_image,
+    generate_quantum_keys, hide_in_image,
 };
-use contacts::{get_contacts, save_contact, delete_contact};
 use tauri::Manager;
-
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -24,12 +22,12 @@ pub fn run() {
             if let Ok(Some(monitor)) = window.primary_monitor() {
                 let size = monitor.size();
                 let scale_factor = monitor.scale_factor();
-                
+
                 // Calculamos el ancho físico (550 logical -> physical)
                 let width = 550.0 * scale_factor;
                 // Calculamos el alto al 90% de la pantalla física
                 let height = size.height as f64 * 0.90;
-                
+
                 // Aplicamos el tamaño
                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
                     width: width as u32,
@@ -46,8 +44,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            encrypt_file, 
-            decrypt_file, 
+            encrypt_file,
+            decrypt_file,
             generate_quantum_keys,
             encrypt_folder,
             decrypt_folder,

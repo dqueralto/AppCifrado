@@ -1,17 +1,17 @@
-use serde::{Serialize, Deserialize};
-use std::fs;
-use tauri::{AppHandle, Manager};
-use std::path::PathBuf;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use argon2::{Argon2, Params};
-use rand::{RngCore, rngs::OsRng};
-use zeroize::Zeroizing;
-use std::sync::Mutex;
+use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{Instant, Duration};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Manager};
+use zeroize::Zeroizing;
 
 // --- Protección contra fuerza bruta ---
 // Almacena el número de intentos fallidos y el momento del primer fallo.
@@ -23,8 +23,8 @@ const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(30);
 
 fn check_and_register_attempt(key: &str, success: bool) -> Result<(), String> {
-    let mut map = FAILED_ATTEMPTS.lock().map_err(|e| e.to_string())?;
-    
+    let mut map = FAILED_ATTEMPTS.lock().map_err(|_| "Error interno: Fallo al acceder al registro de seguridad")?;
+
     if success {
         map.remove(key);
         return Ok(());
@@ -69,7 +69,10 @@ struct EncryptedStore {
 }
 
 fn get_contacts_path(app: &AppHandle) -> PathBuf {
-    let mut path = app.path().app_config_dir().expect("No se pudo encontrar el directorio de configuración");
+    let mut path = app
+        .path()
+        .app_config_dir()
+        .expect("No se pudo encontrar el directorio de configuración");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
@@ -83,11 +86,7 @@ fn get_contacts_path(app: &AppHandle) -> PathBuf {
 fn derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0u8; 32]);
     let config = Params::new(65536, 3, 4, None).expect("Parámetros de Argon2 inválidos");
-    let argon2 = Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        config,
-    );
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, config);
     let _ = argon2.hash_password_into(password.as_bytes(), salt, key.as_mut());
     key
 }
@@ -100,10 +99,10 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
     }
 
     let pass = password.ok_or("Se requiere contraseña maestra para abrir la libreta")?;
-    
+
     // Verificar si está bloqueado antes de intentar
     {
-        let map = FAILED_ATTEMPTS.lock().map_err(|e| e.to_string())?;
+        let map = FAILED_ATTEMPTS.lock().map_err(|_| "Error interno: Fallo al acceder al registro de seguridad")?;
         if let Some((attempts, since)) = map.get("contacts") {
             if *attempts >= MAX_ATTEMPTS && since.elapsed() < LOCKOUT_DURATION {
                 let remaining = LOCKOUT_DURATION
@@ -117,16 +116,16 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
         }
     }
 
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let store: EncryptedStore = serde_json::from_str(&content)
-        .map_err(|_| "Error al leer la bóveda de contactos")?;
+    let content = fs::read_to_string(path).map_err(|_| "Error de I/O al leer la libreta de contactos desde el disco")?;
+    let store: EncryptedStore =
+        serde_json::from_str(&content).map_err(|_| "Error al leer la bóveda de contactos")?;
 
-    let salt = hex::decode(store.salt).map_err(|e| e.to_string())?;
-    let nonce_bytes = hex::decode(store.nonce).map_err(|e| e.to_string())?;
-    let encrypted_data = hex::decode(store.data).map_err(|e| e.to_string())?;
+    let salt = hex::decode(store.salt).map_err(|_| "Error interno: Salt corrupto en la bóveda de contactos")?;
+    let nonce_bytes = hex::decode(store.nonce).map_err(|_| "Error interno: Nonce corrupto en la bóveda de contactos")?;
+    let encrypted_data = hex::decode(store.data).map_err(|_| "Error interno: Datos cifrados corruptos")?;
 
     let key_bytes = derive_key(&pass, &salt);
-    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|e| e.to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|_| "Error al inicializar el motor de descifrado")?;
 
     let decrypted = cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), encrypted_data.as_slice())
@@ -139,7 +138,7 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
     // Descifrado exitoso: resetear contador
     let _ = check_and_register_attempt("contacts", true);
 
-    let contacts: Vec<Contact> = serde_json::from_slice(&decrypted).map_err(|e| e.to_string())?;
+    let contacts: Vec<Contact> = serde_json::from_slice(&decrypted).map_err(|_| "Error al decodificar la estructura de contactos guardada")?;
     Ok(contacts)
 }
 
@@ -151,13 +150,13 @@ fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> R
     OsRng.fill_bytes(&mut nonce_bytes);
 
     let key_bytes = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|e| e.to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|_| "Error al inicializar el motor de cifrado")?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let json_data = serde_json::to_vec(contacts).map_err(|e| e.to_string())?;
+    let json_data = serde_json::to_vec(contacts).map_err(|_| "Error al codificar la lista de contactos")?;
     let encrypted_data = cipher
         .encrypt(nonce, json_data.as_slice())
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "Fallo al cifrar los contactos")?;
 
     let store = EncryptedStore {
         salt: hex::encode(salt),
@@ -165,8 +164,8 @@ fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> R
         data: hex::encode(encrypted_data),
     };
 
-    let content = serde_json::to_string(&store).map_err(|e| e.to_string())?;
-    fs::write(path, content).map_err(|e| e.to_string())?;
+    let content = serde_json::to_string(&store).map_err(|_| "Error al serializar la bóveda de contactos")?;
+    fs::write(path, content).map_err(|_| "Error de I/O al escribir la libreta de contactos en el disco")?;
     Ok(())
 }
 

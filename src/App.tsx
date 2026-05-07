@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Shield,
   Lock,
@@ -21,7 +22,8 @@ import {
   Info,
   Layers,
   Globe,
-  FileCode2
+  FileCode2,
+  AlertTriangle
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
@@ -55,7 +57,9 @@ export default function App() {
   const [quantumKey, setQuantumKey] = useState("");
   const [verifierKey, setVerifierKey] = useState("");
   const [inputPath, setInputPath] = useState("");
+  const [showInitialWarning, setShowInitialWarning] = useState(true);
   const [processState, setProcessState] = useState<ProcessState>({ status: 'idle', message: "" });
+  const clipboardTimeoutRef = useRef<number | null>(null);
   const [mode, setMode] = useState<'encrypt' | 'decrypt' | 'stego'>('encrypt');
   const [itemType, setItemType] = useState<'file' | 'folder'>('file');
   const [cryptoMethod, setCryptoMethod] = useState<'password' | 'quantum'>('password');
@@ -105,10 +109,10 @@ export default function App() {
   const handleAddContact = async () => {
     if (!newContact.name || !newContact.key || !contactsPassword) return;
     try {
-      await invoke("save_contact", { 
-        password: contactsPassword, 
-        name: newContact.name, 
-        publicKey: newContact.key 
+      await invoke("save_contact", {
+        password: contactsPassword,
+        name: newContact.name,
+        publicKey: newContact.key
       });
       setNewContact({ name: "", key: "" });
       loadContacts();
@@ -126,10 +130,36 @@ export default function App() {
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedToast(true);
-    setTimeout(() => setCopiedToast(false), 2000);
+  const copyToClipboard = async (text: string) => {
+    let success = false;
+    try {
+      await writeText(text);
+      success = true;
+    } catch (e) {
+      try {
+        await navigator.clipboard.writeText(text);
+        success = true;
+      } catch (err2) {
+        console.error("Clipboard Error:", err2);
+      }
+    }
+    
+    if (success) {
+      setCopiedToast(true);
+      setTimeout(() => setCopiedToast(false), 2000);
+    }
+
+    // Auto-clear clipboard after 10 seconds for security
+    if (clipboardTimeoutRef.current) {
+      window.clearTimeout(clipboardTimeoutRef.current);
+    }
+    clipboardTimeoutRef.current = window.setTimeout(async () => {
+      try {
+        await writeText("");
+      } catch (e) {
+        navigator.clipboard.writeText("").catch(() => {});
+      }
+    }, 10000);
   };
 
   const handleGenerateIdentity = async () => {
@@ -141,8 +171,8 @@ export default function App() {
         setShowKeyGuide(false);
         setShowIdentityModal(true);
       }
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      setProcessState({ status: 'error', message: "Error al generar identidad: " + err.toString() });
     }
   };
 
@@ -182,7 +212,7 @@ export default function App() {
       setProcessState({ status: 'error', message: "Se requiere archivo/carpeta y llave/contraseña" });
       return;
     }
-    
+
     if (mode === 'stego' && !inputPath) {
       setProcessState({ status: 'error', message: "Selecciona primero el archivo .vault o la imagen" });
       return;
@@ -199,7 +229,7 @@ export default function App() {
             setProcessState({ status: 'error', message: "Se requiere un archivo de camuflaje" });
             return;
           }
-          
+
           /* 
            * PQC IMPLEMENTATION - STEP 1 (ENCAPSULACIÓN):
            * Encapsular usando ML-KEM-1024 (FIPS 203).
@@ -636,8 +666,8 @@ export default function App() {
                   mode === 'encrypt'
                     ? "bg-brand-violet text-white"
                     : mode === 'decrypt'
-                    ? "bg-brand-emerald text-black"
-                    : "bg-brand-cyan text-black",
+                      ? "bg-brand-emerald text-black"
+                      : "bg-brand-cyan text-black",
                   processState.status === 'processing' && "opacity-50 cursor-wait"
                 )}
               >
@@ -696,7 +726,7 @@ export default function App() {
               <span className="text-[9px] text-white/30 uppercase font-bold tracking-tighter">Cifrado</span>
               <span className="text-[10px] font-medium text-white/60">AES+ChaCha20</span>
             </div>
-            <div 
+            <div
               className="flex-1 p-4 flex flex-col items-center group cursor-pointer hover:bg-white/5 transition-colors border-l border-white/5"
               onClick={() => identity ? setShowIdentityModal(true) : handleGenerateIdentity()}
             >
@@ -847,10 +877,36 @@ export default function App() {
                     </p>
                   </div>
 
-                  <div className="pt-2 flex gap-3">
-                    <button 
+                  <div className="pt-2 flex flex-col sm:flex-row gap-3">
+                    <button
                       onClick={() => {
-                        if(window.confirm("¿Estás seguro? Esto reemplazará tu identidad actual.")) {
+                        if (!identity) return;
+                        const formattedKeys = `=== IDENTIDAD CUÁNTICA CRYPTOBRO ===
+Protocolo: ML-KEM-1024 + ML-DSA-65
+
+[ LLAVES DE CIFRADO (KEM) ]
+Pública (Para recibir archivos - Compartible):
+${identity.kem_pub}
+
+Privada (Para abrir archivos - NO COMPARTIR):
+${identity.kem_priv}
+
+[ LLAVES DE FIRMA (DSA) ]
+Pública (Para verificar tus archivos - Compartible):
+${identity.dsa_pub}
+
+Privada (Para firmar archivos - NO COMPARTIR):
+${identity.dsa_priv}
+====================================`;
+                        copyToClipboard(formattedKeys);
+                      }}
+                      className="flex-[2] py-3 bg-brand-cyan text-black rounded-2xl text-[10px] font-bold uppercase tracking-widest hover:bg-brand-cyan/80 transition-all shadow-lg shadow-brand-cyan/20"
+                    >
+                      Copiar Todas las Llaves (Backup)
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (window.confirm("¿Estás seguro? Esto reemplazará tu identidad actual.")) {
                           handleGenerateIdentity();
                         }
                       }}
@@ -858,9 +914,9 @@ export default function App() {
                     >
                       Regenerar Nueva Identidad
                     </button>
-                    <button 
+                    <button
                       onClick={() => {
-                        if(window.confirm("¿Eliminar identidad de la memoria?")) {
+                        if (window.confirm("¿Eliminar identidad de la memoria?")) {
                           setIdentity(null);
                           setShowIdentityModal(false);
                         }
@@ -906,13 +962,13 @@ export default function App() {
                         className="w-full bg-black/40 border border-white/10 rounded-2xl px-6 py-4 text-center focus:outline-none focus:ring-2 focus:ring-brand-cyan/20"
                       />
                       <div className="flex gap-3">
-                        <button 
+                        <button
                           onClick={closeContacts}
                           className="flex-1 py-3 bg-white/5 rounded-2xl text-[10px] font-bold uppercase tracking-widest text-white/40"
                         >
                           Cancelar
                         </button>
-                        <button 
+                        <button
                           onClick={() => loadContacts()}
                           className="flex-1 py-3 bg-brand-cyan text-black rounded-2xl text-[10px] font-bold uppercase tracking-widest"
                         >
@@ -1087,6 +1143,63 @@ export default function App() {
                   <div className="text-center pt-4">
                     <p className="text-[9px] text-white/20 uppercase tracking-[0.3em]">CryptoBro Security Framework v2.1 • 2026</p>
                   </div>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Initial Security Warning Modal */}
+        <AnimatePresence>
+          {showInitialWarning && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="absolute inset-0 bg-black/80 backdrop-blur-md"
+              />
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: -20 }}
+                className="relative w-full max-w-md bg-black border border-brand-amber-400/30 rounded-[32px] p-8 shadow-2xl overflow-hidden"
+              >
+                {/* Background glow */}
+                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-32 h-32 bg-brand-amber-400/20 rounded-full blur-[50px] pointer-events-none" />
+
+                <div className="relative flex flex-col items-center text-center">
+                  <div className="w-16 h-16 rounded-2xl bg-brand-amber-400/10 flex items-center justify-center border border-brand-amber-400/20 mb-6 text-brand-amber-400 shadow-inner">
+                    <AlertTriangle className="w-8 h-8" />
+                  </div>
+
+                  <h2 className="text-xl font-bold mb-2">Aviso de Seguridad Crítico</h2>
+                  <p className="text-[10px] text-brand-amber-400 font-bold uppercase tracking-widest mb-6">Zero-Knowledge Architecture</p>
+
+                  <div className="bg-white/[0.02] border border-white/5 p-5 rounded-2xl mb-8 space-y-4 text-left">
+                    <p className="text-sm text-white/80 leading-relaxed">
+                      CryptoBro opera en un entorno de <strong className="text-white">memoria volátil</strong> para garantizar máxima seguridad.
+                    </p>
+                    <div className="flex gap-3 items-start">
+                      <div className="w-1.5 h-1.5 rounded-full bg-red-400 mt-1.5 shrink-0" />
+                      <p className="text-xs text-white/60 leading-relaxed">
+                        <strong className="text-red-400">Si cierras la aplicación o regeneras la identidad</strong>, TODAS las claves activas (incluyendo contraseñas maestras y llaves cuánticas en uso) se destruirán irremediablemente.
+                      </p>
+                    </div>
+                    <div className="flex gap-3 items-start">
+                      <div className="w-1.5 h-1.5 rounded-full bg-brand-emerald mt-1.5 shrink-0" />
+                      <p className="text-xs text-white/60 leading-relaxed">
+                        Asegúrate de copiar y guardar tus llaves cuánticas generadas antes de salir. No hay forma de recuperarlas una vez cerrada la sesión y, sin ellas, te será imposible descifrar los archivos cifrados en la sesión en el futuro.
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => setShowInitialWarning(false)}
+                    className="w-full py-4 bg-brand-amber-400/10 hover:bg-brand-amber-400 text-brand-amber-400 hover:text-black font-bold uppercase tracking-widest text-xs rounded-xl transition-all duration-300 border border-brand-amber-400/30 hover:border-transparent"
+                  >
+                    Entendido, asumo el riesgo
+                  </button>
                 </div>
               </motion.div>
             </div>
