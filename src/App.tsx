@@ -74,19 +74,30 @@ export default function App() {
   const [copiedContact, setCopiedContact] = useState<string | null>(null); // Para feedback de copia
   const [copiedToast, setCopiedToast] = useState(false); // Toast de copiado en portapapeles
 
-  // Eliminado el useEffect inicial de loadContacts ya que requiere contraseña y fallará silenciosamente
+  // Función segura para cerrar la libreta: borra SIEMPRE el estado de autenticación.
+  // Esto garantiza que cada apertura del modal requiere contraseña, sin importar
+  // si la app fue minimizada, el modal fue cerrado o se vuelve a abrir en la misma sesión.
+  const closeContacts = () => {
+    setShowContacts(false);
+    setIsContactsUnlocked(false);
+    setContactsPassword("");
+    setContacts([]);
+  };
 
   const loadContacts = async (pass?: string) => {
+    const p = pass || contactsPassword;
+    // Seguridad: nunca intentar cargar sin contraseña
+    if (!p) {
+      setProcessState({ status: 'error', message: "Introduce la contraseña de la libreta" });
+      return;
+    }
     try {
-      const p = pass || contactsPassword;
-      const list: any = await invoke("get_contacts", { password: p || null });
+      const list: any = await invoke("get_contacts", { password: p });
       setContacts(list);
-      if (p) setIsContactsUnlocked(true);
+      setIsContactsUnlocked(true);
     } catch (err) {
-      if (pass || contactsPassword) {
-        setProcessState({ status: 'error', message: "Contraseña de contactos incorrecta o error de acceso" });
-        setIsContactsUnlocked(false);
-      }
+      setProcessState({ status: 'error', message: "Contraseña de contactos incorrecta o error de acceso" });
+      setIsContactsUnlocked(false);
       setContacts([]);
     }
   };
@@ -335,7 +346,7 @@ export default function App() {
                   <HelpCircle className="w-3 h-3" /> Guía
                 </button>
                 <button
-                  onClick={() => setShowContacts(true)}
+                  onClick={() => { setShowContacts(true); }}
                   className="text-[10px] font-bold text-white/40 uppercase tracking-tighter hover:text-brand-cyan transition-colors flex items-center gap-1"
                 >
                   <Users className="w-3 h-3" /> Contactos
@@ -894,7 +905,7 @@ export default function App() {
                       />
                       <div className="flex gap-3">
                         <button 
-                          onClick={() => setShowContacts(false)}
+                          onClick={closeContacts}
                           className="flex-1 py-3 bg-white/5 rounded-2xl text-[10px] font-bold uppercase tracking-widest text-white/40"
                         >
                           Cancelar
@@ -918,7 +929,7 @@ export default function App() {
                         </h2>
                         <p className="text-xs text-white/40 mt-1">Llaves Públicas Guardadas (Cifrado AES-256)</p>
                       </div>
-                      <button onClick={() => setShowContacts(false)} className="text-white/20 hover:text-white/60 transition-colors">
+                      <button onClick={closeContacts} className="text-white/20 hover:text-white/60 transition-colors">
                         <XCircle className="w-6 h-6" />
                       </button>
                     </div>
