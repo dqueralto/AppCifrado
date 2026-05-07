@@ -375,7 +375,7 @@ export default function App() {
                 onClick={() => { setMode('encrypt'); setInputPath(""); }}
                 className={cn(
                   "flex-1 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                  mode === 'encrypt' ? "bg-white/10 text-brand-cyan shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
+                  mode === 'encrypt' ? "bg-white/10 text-brand-violet shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
                 )}
               >
                 <Lock className="w-4 h-4" /> Cifrar
@@ -384,7 +384,7 @@ export default function App() {
                 onClick={() => { setMode('decrypt'); setInputPath(""); }}
                 className={cn(
                   "flex-1 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                  mode === 'decrypt' ? "bg-white/10 text-brand-violet shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
+                  mode === 'decrypt' ? "bg-white/10 text-brand-emerald shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
                 )}
               >
                 <Unlock className="w-4 h-4" /> Descifrar
@@ -393,7 +393,7 @@ export default function App() {
                 onClick={() => { setMode('stego'); setInputPath(""); }}
                 className={cn(
                   "flex-1 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                  mode === 'stego' ? "bg-white/10 text-brand-emerald shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
+                  mode === 'stego' ? "bg-white/10 text-brand-cyan shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
                 )}
               >
                 <Zap className="w-4 h-4" /> Ocultar
@@ -634,8 +634,10 @@ export default function App() {
                 className={cn(
                   "w-full h-16 rounded-2xl font-bold text-lg flex items-center justify-center gap-3 transition-all relative overflow-hidden group",
                   mode === 'encrypt'
-                    ? "bg-brand-cyan text-black"
-                    : "bg-brand-violet text-white",
+                    ? "bg-brand-violet text-white"
+                    : mode === 'decrypt'
+                    ? "bg-brand-emerald text-black"
+                    : "bg-brand-cyan text-black",
                   processState.status === 'processing' && "opacity-50 cursor-wait"
                 )}
               >
@@ -658,7 +660,7 @@ export default function App() {
                 {/* Button Glow Effect */}
                 <div className={cn(
                   "absolute inset-0 opacity-0 group-hover:opacity-20 transition-opacity",
-                  mode === 'encrypt' ? "bg-white" : "bg-brand-cyan"
+                  mode === 'encrypt' ? "bg-brand-cyan" : mode === 'decrypt' ? "bg-white" : "bg-white"
                 )} />
               </button>
             </div>
