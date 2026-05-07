@@ -20,24 +20,26 @@ pub fn run() {
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
 
-            // Ajustar al alto máximo de la pantalla dinámicamente
+            // Ajustar a un diseño horizontal de escritorio (1100px de ancho)
             if let Ok(Some(monitor)) = window.primary_monitor() {
                 let size = monitor.size();
                 let scale_factor = monitor.scale_factor();
                 
-                // Calculamos el ancho lógico (850) a físico
-                let width = 850.0 * scale_factor;
+                // Ancho de escritorio: 1100px
+                let width = 1100.0 * scale_factor;
                 
-                // Aplicamos el tamaño: Ancho fijo, Alto máximo del monitor
+                // Alto: 90% del monitor para evitar quedar bajo la barra de tareas/dock
+                let height = (size.height as f64 * 0.9) as u32;
+                
                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
                     width: width as u32,
-                    height: size.height,
+                    height: height,
                 }));
 
-                // Centrar horizontalmente pero pegar al techo
+                // Centrar totalmente en la pantalla
                 let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
                     x: ((size.width as f64 - width) / 2.0) as i32,
-                    y: 0,
+                    y: ((size.height as f64 - height as f64) / 2.0) as i32,
                 }));
             }
 

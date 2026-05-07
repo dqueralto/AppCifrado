@@ -21,7 +21,8 @@ import {
   Info,
   Layers,
   Globe,
-  FileCode2
+  FileCode2,
+  User
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
@@ -321,371 +322,336 @@ export default function App() {
     <div className="min-h-screen text-white flex flex-col items-center justify-center p-8 font-sans selection:bg-brand-cyan/30">
 
       <motion.div
-        initial={{ opacity: 0, scale: 0.95 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="w-full max-w-lg relative"
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="w-full max-w-5xl relative"
       >
         {/* Main Glass Card */}
-        <div className="bg-black/40 backdrop-blur-3xl border border-white/10 rounded-[32px] shadow-2xl overflow-hidden">
-
-          {/* Header Section */}
-          <div className="p-8 pb-0 flex flex-col items-center text-center">
-            <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-brand-cyan/20 to-brand-violet/20 flex items-center justify-center border border-white/10 mb-6 shadow-inner">
-              <Shield className="w-10 h-10 text-brand-cyan" />
-            </div>
-            <h1 className="text-3xl font-bold tracking-tight mb-2">CryptoBro</h1>
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2 text-xs font-medium text-white/40 uppercase tracking-widest bg-white/5 px-3 py-1 rounded-full border border-white/5">
-                <Fingerprint className="w-3 h-3" /> Seguridad Post-Cuántica
+        <div className="bg-black/40 backdrop-blur-3xl border border-white/10 rounded-[40px] shadow-2xl overflow-hidden flex flex-col md:flex-row min-h-[650px]">
+          
+          {/* Sidebar / Left Column: Controls & File Selection */}
+          <div className="w-full md:w-5/12 border-r border-white/5 bg-white/[0.02] flex flex-col p-8">
+            {/* Header Mini */}
+            <div className="flex items-center gap-4 mb-8">
+              <div className="w-12 h-12 rounded-2xl bg-brand-cyan/20 flex items-center justify-center border border-white/10 shadow-inner">
+                <Shield className="w-6 h-6 text-brand-cyan" />
               </div>
-              <div className="flex items-center gap-4">
-                <button
-                  onClick={() => setShowGuide(true)}
-                  className="text-[10px] font-bold text-white/40 uppercase tracking-tighter hover:text-brand-cyan transition-colors flex items-center gap-1"
-                >
+              <div>
+                <h1 className="text-2xl font-bold tracking-tight">CryptoBro</h1>
+                <p className="text-[10px] text-white/40 font-bold uppercase tracking-widest">Suite de Seguridad</p>
+              </div>
+            </div>
+
+            {/* Mode Selector */}
+            <div className="space-y-6 flex-1">
+              <div className="space-y-2">
+                <p className="text-[10px] font-bold text-white/20 uppercase tracking-widest px-1">Operación Principal</p>
+                <div className="bg-white/5 p-1 rounded-2xl flex border border-white/10">
+                  <button
+                    onClick={() => { setMode('encrypt'); setInputPath(""); }}
+                    className={cn(
+                      "flex-1 py-2 rounded-xl text-xs font-semibold transition-all flex items-center justify-center gap-2",
+                      mode === 'encrypt' ? "bg-white/10 text-brand-cyan shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
+                    )}
+                  >
+                    <Lock className="w-3.5 h-3.5" /> Cifrar
+                  </button>
+                  <button
+                    onClick={() => { setMode('decrypt'); setInputPath(""); }}
+                    className={cn(
+                      "flex-1 py-2 rounded-xl text-xs font-semibold transition-all flex items-center justify-center gap-2",
+                      mode === 'decrypt' ? "bg-white/10 text-brand-violet shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
+                    )}
+                  >
+                    <Unlock className="w-3.5 h-3.5" /> Descifrar
+                  </button>
+                  <button
+                    onClick={() => { setMode('stego'); setInputPath(""); }}
+                    className={cn(
+                      "flex-1 py-2 rounded-xl text-xs font-semibold transition-all flex items-center justify-center gap-2",
+                      mode === 'stego' ? "bg-white/10 text-brand-emerald shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
+                    )}
+                  >
+                    <Zap className="w-3.5 h-3.5" /> Ocultar
+                  </button>
+                </div>
+              </div>
+
+              {/* File Dropzone - Integrated in Sidebar */}
+              <div className="space-y-3">
+                <p className="text-[10px] font-bold text-white/20 uppercase tracking-widest px-1">Entrada de Datos</p>
+                
+                {mode !== 'stego' && (
+                  <div className="flex gap-2 mb-2">
+                    <button
+                      onClick={() => { setItemType('file'); setInputPath(""); }}
+                      className={cn(
+                        "flex-1 text-[9px] font-bold uppercase tracking-widest py-2 rounded-lg border transition-all flex items-center justify-center gap-2",
+                        itemType === 'file' ? "border-brand-cyan/50 text-brand-cyan bg-brand-cyan/5" : "border-white/5 text-white/20 hover:text-white/40"
+                      )}
+                    >
+                      <FileText className="w-3 h-3" /> Archivo
+                    </button>
+                    <button
+                      onClick={() => { setItemType('folder'); setInputPath(""); }}
+                      className={cn(
+                        "flex-1 text-[9px] font-bold uppercase tracking-widest py-2 rounded-lg border transition-all flex items-center justify-center gap-2",
+                        itemType === 'folder' ? "border-brand-cyan/50 text-brand-cyan bg-brand-cyan/5" : "border-white/5 text-white/20 hover:text-white/40"
+                      )}
+                    >
+                      <Shield className="w-3 h-3" /> Carpeta
+                    </button>
+                  </div>
+                )}
+
+                <div className={cn(
+                  "group relative overflow-hidden rounded-[24px] border border-dashed transition-all duration-500",
+                  inputPath ? "bg-white/5 border-brand-cyan/30" : "bg-white/[0.02] border-white/10 hover:border-white/20"
+                )}>
+                  <button onClick={handleSelectFile} className="w-full p-6 flex flex-col items-center justify-center gap-3">
+                    <div className={cn(
+                      "w-10 h-10 rounded-xl flex items-center justify-center transition-all",
+                      inputPath ? "bg-brand-cyan text-black" : "bg-white/5 text-white/20"
+                    )}>
+                      {itemType === 'file' ? <FileText className="w-5 h-5" /> : <Shield className="w-5 h-5" />}
+                    </div>
+                    <p className="text-[10px] font-bold text-white/60 tracking-wide uppercase text-center px-2">
+                      {inputPath ? inputPath.split('/').pop() : `Seleccionar ${itemType === 'file' ? 'Archivo' : 'Carpeta'}`}
+                    </p>
+                  </button>
+                </div>
+
+                {mode === 'stego' && stegoAction === 'hide' && (
+                  <div className={cn(
+                    "group relative overflow-hidden rounded-[24px] border border-dashed transition-all duration-500 mt-2",
+                    carrierPath ? "bg-white/5 border-brand-emerald/30" : "bg-white/[0.02] border-white/10 hover:border-white/20"
+                  )}>
+                    <button onClick={handleSelectCarrier} className="w-full p-6 flex flex-col items-center justify-center gap-3">
+                      <div className={cn(
+                        "w-10 h-10 rounded-xl flex items-center justify-center transition-all",
+                        carrierPath ? "bg-brand-emerald text-black" : "bg-white/5 text-white/20"
+                      )}>
+                        <Globe className="w-5 h-5" />
+                      </div>
+                      <p className="text-[10px] font-bold text-white/60 tracking-wide uppercase text-center">
+                        {carrierPath ? carrierPath.split('/').pop() : 'Archivo de Camuflaje'}
+                      </p>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Bottom Actions */}
+            <div className="mt-8 pt-6 border-t border-white/5 flex justify-between items-center">
+              <div className="flex gap-4">
+                <button onClick={() => setShowGuide(true)} className="text-[9px] font-bold text-white/20 hover:text-brand-cyan uppercase flex items-center gap-1.5 transition-colors">
                   <HelpCircle className="w-3 h-3" /> Guía
                 </button>
-                <button
-                  onClick={() => { setShowContacts(true); }}
-                  className="text-[10px] font-bold text-white/40 uppercase tracking-tighter hover:text-brand-cyan transition-colors flex items-center gap-1"
-                >
+                <button onClick={() => setShowContacts(true)} className="text-[9px] font-bold text-white/20 hover:text-brand-cyan uppercase flex items-center gap-1.5 transition-colors">
                   <Users className="w-3 h-3" /> Contactos
                 </button>
-                {identity && (
-                  <button
-                    onClick={() => {
-                      setIdentity(null);
-                      setQuantumKey("");
-                      setVerifierKey("");
-                    }}
-                    className="text-[10px] font-bold text-brand-emerald/80 uppercase tracking-tighter hover:text-red-400 transition-colors flex items-center gap-1"
-                    title="Cerrar Sesión Cuántica"
-                  >
-                    <Shield className="w-3 h-3" /> Salir (KEM)
-                  </button>
-                )}
               </div>
+              <div className="text-[9px] text-white/10 font-bold uppercase tracking-tighter">V0.1.0-STABLE</div>
             </div>
           </div>
 
-          {/* Mode & Method Selectors */}
-          <div className="px-8 mt-10 space-y-4">
-            <div className="bg-white/5 p-1 rounded-2xl flex border border-white/10">
-              <button
-                onClick={() => { setMode('encrypt'); setInputPath(""); }}
-                className={cn(
-                  "flex-1 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                  mode === 'encrypt' ? "bg-white/10 text-brand-cyan shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
-                )}
-              >
-                <Lock className="w-4 h-4" /> Cifrar
-              </button>
-              <button
-                onClick={() => { setMode('decrypt'); setInputPath(""); }}
-                className={cn(
-                  "flex-1 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                  mode === 'decrypt' ? "bg-white/10 text-brand-violet shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
-                )}
-              >
-                <Unlock className="w-4 h-4" /> Descifrar
-              </button>
-              <button
-                onClick={() => { setMode('stego'); setInputPath(""); }}
-                className={cn(
-                  "flex-1 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2",
-                  mode === 'stego' ? "bg-white/10 text-brand-emerald shadow-lg border border-white/10" : "text-white/40 hover:text-white/60"
-                )}
-              >
-                <Zap className="w-4 h-4" /> Ocultar
-              </button>
-            </div>
-
-            {mode === 'stego' ? (
-              <div className="flex bg-white/5 p-1 rounded-xl border border-white/5">
-                <button
-                  onClick={() => setStegoAction('hide')}
-                  className={cn(
-                    "flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
-                    stegoAction === 'hide' ? "bg-brand-emerald/20 text-brand-emerald" : "text-white/20 hover:text-white/40"
-                  )}
-                >
-                  Ocultar en Imagen
-                </button>
-                <button
-                  onClick={() => setStegoAction('extract')}
-                  className={cn(
-                    "flex-1 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
-                    stegoAction === 'extract' ? "bg-brand-emerald/20 text-brand-emerald" : "text-white/20 hover:text-white/40"
-                  )}
-                >
-                  Extraer de Imagen
-                </button>
+          {/* Right Column: Key Configuration & Execution */}
+          <div className="flex-1 p-8 flex flex-col">
+            
+            {/* Context Title */}
+            <div className="mb-10 flex justify-between items-end">
+              <div>
+                <p className="text-[10px] font-bold text-brand-cyan uppercase tracking-[0.2em] mb-1">Configuración</p>
+                <h2 className="text-xl font-bold text-white">Parámetros de Seguridad</h2>
               </div>
-            ) : (
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => { setItemType('file'); setInputPath(""); }}
-                    className={cn(
-                      "text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg border transition-all flex items-center gap-2",
-                      itemType === 'file' ? "border-brand-cyan/50 text-brand-cyan bg-brand-cyan/5" : "border-white/5 text-white/20 hover:text-white/40"
-                    )}
-                  >
-                    <FileText className="w-3 h-3" /> Archivo
-                  </button>
-                  <button
-                    onClick={() => { setItemType('folder'); setInputPath(""); }}
-                    className={cn(
-                      "text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg border transition-all flex items-center gap-2",
-                      itemType === 'folder' ? "border-brand-cyan/50 text-brand-cyan bg-brand-cyan/5" : "border-white/5 text-white/20 hover:text-white/40"
-                    )}
-                  >
-                    <Shield className="w-3 h-3" /> Carpeta
-                  </button>
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => { setCryptoMethod('password'); setInputPath(""); }}
-                    className={cn(
-                      "text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg border transition-all flex items-center gap-2",
-                      cryptoMethod === 'password' ? "border-brand-emerald/50 text-brand-emerald bg-brand-emerald/5" : "border-white/5 text-white/20 hover:text-white/40"
-                    )}
-                  >
-                    <Key className="w-3 h-3" /> Contraseña
-                  </button>
-                  <button
-                    onClick={() => { setCryptoMethod('quantum'); setItemType('file'); setInputPath(""); }}
-                    className={cn(
-                      "text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg border transition-all flex items-center gap-2",
-                      cryptoMethod === 'quantum' ? "border-brand-cyan/50 text-brand-cyan bg-brand-cyan/5" : "border-white/5 text-white/20 hover:text-white/40"
-                    )}
-                  >
-                    <Zap className="w-3 h-3" /> PQC
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Interaction Area */}
-          <div className="p-8 space-y-6">
-
-            {/* File Dropzone */}
-            <div className="space-y-4">
-              <div className={cn(
-                "group relative overflow-hidden rounded-[24px] border-2 border-dashed transition-all duration-500",
-                inputPath ? "bg-white/10 border-brand-cyan/50" : "bg-white/5 border-white/5 hover:border-white/10",
-                mode === 'stego' && stegoAction === 'extract' && "border-brand-emerald/30"
-              )}>
-                <button
-                  onClick={handleSelectFile}
-                  className="w-full p-8 flex flex-col items-center justify-center gap-4 group"
-                >
-                  <div className={cn(
-                    "w-12 h-12 rounded-2xl flex items-center justify-center transition-all duration-500 group-hover:scale-110 shadow-lg",
-                    inputPath ? "bg-brand-cyan text-black" : "bg-white/5 text-white/20",
-                    mode === 'stego' && stegoAction === 'extract' && "bg-brand-emerald/20 text-brand-emerald"
-                  )}>
-                    {itemType === 'file' ? <FileText className="w-6 h-6" /> : <Shield className="w-6 h-6" />}
-                  </div>
-                  <div className="text-center">
-                    <p className="text-[11px] font-bold text-white/80 tracking-wide uppercase">
-                      {inputPath ? (inputPath.split('/').pop()) : (
-                        mode === 'stego'
-                          ? (stegoAction === 'hide' ? 'Paso 1: Selecciona el .vault' : 'Selecciona Imagen Camuflada')
-                          : `Seleccionar ${itemType === 'file' ? 'Archivo' : 'Carpeta'}`
-                      )}
-                    </p>
-                  </div>
-                </button>
-              </div>
-
-              {mode === 'stego' && stegoAction === 'hide' && (
-                <div className={cn(
-                  "group relative overflow-hidden rounded-[24px] border-2 border-dashed transition-all duration-500",
-                  carrierPath ? "bg-white/10 border-brand-emerald/50" : "bg-white/5 border-white/5 hover:border-white/10"
-                )}>
-                  <button
-                    onClick={handleSelectCarrier}
-                    className="w-full p-8 flex flex-col items-center justify-center gap-4 group"
-                  >
-                    <div className={cn(
-                      "w-12 h-12 rounded-2xl flex items-center justify-center transition-all duration-500 group-hover:scale-110 shadow-lg",
-                      carrierPath ? "bg-brand-emerald text-black" : "bg-white/5 text-white/20"
-                    )}>
-                      <Globe className="w-6 h-6" />
-                    </div>
-                    <div className="text-center">
-                      <p className="text-[11px] font-bold text-white/80 tracking-wide uppercase">
-                        {carrierPath ? (carrierPath.split('/').pop()) : 'Paso 2: Selecciona el Archivo de Camuflaje'}
-                      </p>
-                    </div>
-                  </button>
+              {identity && (
+                <div className="px-3 py-1 bg-brand-emerald/10 border border-brand-emerald/20 rounded-full flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-brand-emerald animate-pulse" />
+                  <span className="text-[9px] font-bold text-brand-emerald uppercase tracking-widest">Identidad PQC Activa</span>
                 </div>
               )}
             </div>
 
-            {/* Secret Input */}
-            {mode !== 'stego' && (
-              <div className="space-y-4">
-                <div className="flex justify-between items-center px-1">
-                  <span className="text-[10px] font-bold text-white/40 uppercase tracking-widest">
-                    {cryptoMethod === 'password' ? 'Contraseña Maestra' : 'Identidad Cuántica (ML-KEM)'}
-                  </span>
-                  <div className="flex gap-2">
-                    {cryptoMethod === 'password' && (
-                      <span className="text-[9px] text-brand-emerald font-bold uppercase">Militar-Grade</span>
+            <div className="flex-1 space-y-8">
+              {/* Method Switcher (inside right col) */}
+              {mode !== 'stego' && (
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => { setCryptoMethod('password'); }}
+                    className={cn(
+                      "flex-1 py-3 rounded-2xl border transition-all flex flex-col items-center gap-2",
+                      cryptoMethod === 'password' ? "bg-brand-emerald/5 border-brand-emerald/30 text-brand-emerald" : "bg-white/5 border-white/5 text-white/20"
                     )}
-                  </div>
+                  >
+                    <Key className="w-5 h-5" />
+                    <span className="text-[9px] font-bold uppercase tracking-widest">Contraseña</span>
+                  </button>
+                  <button
+                    onClick={() => { setCryptoMethod('quantum'); setItemType('file'); }}
+                    className={cn(
+                      "flex-1 py-3 rounded-2xl border transition-all flex flex-col items-center gap-2",
+                      cryptoMethod === 'quantum' ? "bg-brand-cyan/5 border-brand-cyan/30 text-brand-cyan" : "bg-white/5 border-white/5 text-white/20"
+                    )}
+                  >
+                    <Zap className="w-5 h-5" />
+                    <span className="text-[9px] font-bold uppercase tracking-widest">Post-Cuántico</span>
+                  </button>
                 </div>
+              )}
 
-                {cryptoMethod === 'password' ? (
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Mínimo 12 caracteres recomendados..."
-                    className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 focus:outline-none focus:ring-2 focus:ring-brand-cyan/20 transition-all placeholder:text-white/10 text-sm tracking-widest font-mono"
-                  />
-                ) : (
-                  <div className="space-y-4">
-                    <div className="space-y-1">
-                      <p className="text-[9px] text-white/20 uppercase px-1">{mode === 'encrypt' ? 'Llave de Cifrado (KEM)' : 'Llave de Descifrado (KEM)'}</p>
-                      <textarea
-                        value={quantumKey}
-                        onChange={(e) => setQuantumKey(e.target.value)}
-                        placeholder={mode === 'encrypt' ? "Pega aquí la llave pública hexadecimal..." : "Pega aquí tu llave privada hexadecimal..."}
-                        className="w-full h-24 bg-white/5 border border-white/10 rounded-2xl px-6 py-4 focus:outline-none focus:ring-2 focus:ring-brand-cyan/20 transition-all placeholder:text-white/10 text-[10px] leading-tight font-mono resize-none"
-                      />
+              {/* Dynamic Inputs Based on Selection */}
+              <div className="space-y-6">
+                {mode === 'stego' ? (
+                  <div className="space-y-4 py-10 text-center">
+                    <div className="w-16 h-16 bg-brand-emerald/10 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <Zap className="text-brand-emerald w-8 h-8" />
                     </div>
-
-                    {mode === 'decrypt' && (
-                      <div className="space-y-1">
-                        <p className="text-[9px] text-brand-emerald/40 uppercase px-1 flex items-center gap-1">
-                          <CheckCircle2 className="w-2.5 h-2.5" /> Llave de Verificación (ML-DSA) - Opcional
-                        </p>
-                        <textarea
-                          value={verifierKey}
-                          onChange={(e) => setVerifierKey(e.target.value)}
-                          placeholder="Pega la llave pública del remitente para verificar la integridad..."
-                          className="w-full h-16 bg-white/5 border border-white/10 rounded-2xl px-6 py-4 focus:outline-none focus:ring-2 focus:ring-brand-emerald/20 transition-all placeholder:text-white/10 text-[9px] leading-tight font-mono resize-none"
-                        />
-                      </div>
-                    )}
-
-                    {mode === 'encrypt' && contacts.length > 0 && (
-                      <div className="flex flex-wrap gap-2">
-                        {contacts.map(c => (
-                          <button
-                            key={c.name}
-                            onClick={() => setQuantumKey(c.public_key)}
-                            className="text-[9px] px-2 py-1 rounded-md bg-white/5 border border-white/5 hover:border-brand-cyan/30 text-white/40 hover:text-brand-cyan transition-all"
-                          >
-                            {c.name}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Options */}
-            {mode === 'encrypt' && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="flex items-center justify-between px-4 py-3 bg-white/5 border border-white/10 rounded-2xl"
-              >
-                <div className="flex items-center gap-3">
-                  <div className={cn(
-                    "p-2 rounded-lg transition-colors",
-                    shredOriginal ? "bg-red-500/20 text-red-400" : "bg-white/5 text-white/20"
-                  )}>
-                    <ShieldAlert className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <p className="text-[11px] font-bold text-white/60 uppercase tracking-widest">Borrado Seguro</p>
-                    <p className="text-[9px] text-white/30 uppercase">Destruir original tras cifrar</p>
-                  </div>
-                </div>
-                <button
-                  onClick={() => setShredOriginal(!shredOriginal)}
-                  className={cn(
-                    "w-12 h-6 rounded-full relative transition-all duration-300",
-                    shredOriginal ? "bg-red-500" : "bg-white/10"
-                  )}
-                >
-                  <motion.div
-                    animate={{ x: shredOriginal ? 24 : 4 }}
-                    className="absolute top-1 left-0 w-4 h-4 bg-white rounded-full shadow-lg"
-                  />
-                </button>
-              </motion.div>
-            )}
-
-            {/* Execute Button */}
-            <div className="pt-2">
-              <button
-                disabled={processState.status === 'processing'}
-                onClick={runOperation}
-                className={cn(
-                  "w-full h-16 rounded-2xl font-bold text-lg flex items-center justify-center gap-3 transition-all relative overflow-hidden group",
-                  mode === 'encrypt'
-                    ? "bg-brand-cyan text-black"
-                    : "bg-brand-violet text-white",
-                  processState.status === 'processing' && "opacity-50 cursor-wait"
-                )}
-              >
-                {processState.status === 'processing' ? (
-                  <div className="flex items-center gap-3">
-                    <Activity className="w-5 h-5 animate-pulse" />
-                    <span>PROCESANDO...</span>
+                    <h3 className="text-lg font-bold">Esteganografía Activa</h3>
+                    <p className="text-xs text-white/40 max-w-xs mx-auto">
+                      {stegoAction === 'hide' 
+                        ? 'Oculta tu bóveda cifrada concatenándola detrás del stream de datos de un archivo multimedia legítimo.' 
+                        : 'Analiza un archivo multimedia en busca del marcador de inicio de CryptoBro para extraer la bóveda oculta.'}
+                    </p>
+                    <div className="flex justify-center gap-4 pt-4">
+                      <button onClick={() => setStegoAction('hide')} className={cn("px-4 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest border transition-all", stegoAction === 'hide' ? "bg-brand-emerald/20 border-brand-emerald/40 text-brand-emerald" : "bg-white/5 border-white/5 text-white/20")}>Ocultar</button>
+                      <button onClick={() => setStegoAction('extract')} className={cn("px-4 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest border transition-all", stegoAction === 'extract' ? "bg-brand-emerald/20 border-brand-emerald/40 text-brand-emerald" : "bg-white/5 border-white/5 text-white/20")}>Extraer</button>
+                    </div>
                   </div>
                 ) : (
                   <>
-                    <span>
-                      {mode === 'stego'
-                        ? (stegoAction === 'hide' ? 'CAMUFLAR AHORA' : 'EXTRAER AHORA')
-                        : (mode === 'encrypt' ? 'CIFRAR AHORA' : 'DESCIFRAR AHORA')}
-                    </span>
-                    <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                    {cryptoMethod === 'password' ? (
+                      <div className="space-y-3">
+                        <div className="flex justify-between items-center px-1">
+                          <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest">Contraseña Maestra</p>
+                          <span className="text-[9px] text-brand-emerald font-bold uppercase">Argon2id + AES-256</span>
+                        </div>
+                        <input
+                          type="password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder="Mínimo 12 caracteres..."
+                          className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 focus:outline-none focus:ring-2 focus:ring-brand-emerald/20 text-sm font-mono tracking-widest"
+                        />
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        <div className="space-y-1">
+                          <p className="text-[9px] text-white/40 uppercase px-1">{mode === 'encrypt' ? 'Llave Pública del Recipiente (KEM)' : 'Tu Llave Privada (KEM)'}</p>
+                          <textarea
+                            value={quantumKey}
+                            onChange={(e) => setQuantumKey(e.target.value)}
+                            className="w-full h-32 bg-white/5 border border-white/10 rounded-2xl px-6 py-4 focus:outline-none focus:ring-2 focus:ring-brand-cyan/20 text-[10px] font-mono leading-tight resize-none"
+                            placeholder="Pega la llave hexadecimal aquí..."
+                          />
+                        </div>
+                        {mode === 'decrypt' && (
+                          <div className="space-y-1">
+                            <p className="text-[9px] text-white/40 uppercase px-1">Firma del Remitente (DSA) - Opcional</p>
+                            <textarea
+                              value={verifierKey}
+                              onChange={(e) => setVerifierKey(e.target.value)}
+                              className="w-full h-16 bg-white/5 border border-white/10 rounded-2xl px-6 py-4 focus:outline-none focus:ring-2 focus:ring-brand-emerald/20 text-[9px] font-mono leading-tight resize-none"
+                              placeholder="Llave de verificación..."
+                            />
+                          </div>
+                        )}
+                        {mode === 'encrypt' && contacts.length > 0 && (
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            {contacts.map(c => (
+                              <button key={c.name} onClick={() => setQuantumKey(c.public_key)} className="text-[8px] px-2 py-1 rounded bg-white/5 border border-white/5 hover:border-brand-cyan/30 text-white/40 hover:text-brand-cyan transition-all uppercase font-bold tracking-widest">{c.name}</button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </>
                 )}
-
-                {/* Button Glow Effect */}
-                <div className={cn(
-                  "absolute inset-0 opacity-0 group-hover:opacity-20 transition-opacity",
-                  mode === 'encrypt' ? "bg-white" : "bg-brand-cyan"
-                )} />
-              </button>
+              </div>
             </div>
 
-            {/* Status Feedback */}
-            <AnimatePresence>
-              {processState.status !== 'idle' && processState.status !== 'processing' && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
+            {/* Final Action Area */}
+            <div className="mt-8 pt-8 border-t border-white/5 space-y-4">
+              <div className="flex items-center justify-between">
+                {mode === 'encrypt' && (
+                  <div 
+                    onClick={() => setShredOriginal(!shredOriginal)}
+                    className="flex items-center gap-3 cursor-pointer group"
+                  >
+                    <div className={cn("w-5 h-5 rounded-md flex items-center justify-center border transition-all", shredOriginal ? "bg-red-500/20 border-red-500 text-red-500" : "bg-white/5 border-white/10 text-transparent")}>
+                      <Trash2 className="w-3 h-3" />
+                    </div>
+                    <span className={cn("text-[10px] font-bold uppercase tracking-widest transition-colors", shredOriginal ? "text-red-400" : "text-white/20 group-hover:text-white/40")}>Borrado Seguro DoD 5220.22-M</span>
+                  </div>
+                )}
+                {identity && (
+                  <button onClick={() => setShowIdentityModal(true)} className="text-[10px] font-bold text-brand-cyan/60 hover:text-brand-cyan uppercase tracking-widest flex items-center gap-2">
+                    <User className="w-3.5 h-3.5" /> Ver Mi ID
+                  </button>
+                )}
+              </div>
+
+              {/* Execute Button */}
+              <div className="pt-2">
+                <button
+                  disabled={processState.status === 'processing'}
+                  onClick={runOperation}
                   className={cn(
-                    "p-5 rounded-2xl flex items-start gap-4 text-sm border",
-                    processState.status === 'success' && "bg-brand-emerald/10 border-brand-emerald/20 text-brand-emerald",
-                    processState.status === 'error' && "bg-red-500/10 border-red-500/20 text-red-400"
+                    "w-full h-16 rounded-2xl font-bold text-lg flex items-center justify-center gap-3 transition-all relative overflow-hidden group",
+                    mode === 'encrypt'
+                      ? "bg-brand-cyan text-black"
+                      : "bg-brand-violet text-white",
+                    processState.status === 'processing' && "opacity-50 cursor-wait"
                   )}
                 >
-                  {processState.status === 'success' ? <CheckCircle2 className="w-5 h-5 mt-0.5" /> : <XCircle className="w-5 h-5 mt-0.5" />}
-                  <div className="flex-1">
-                    <p className="font-bold uppercase text-[10px] tracking-widest mb-1">
-                      {processState.status === 'success' ? 'Resultado Exitoso' : 'Error del Sistema'}
-                    </p>
-                    <p className="opacity-80 leading-relaxed text-xs">{processState.message}</p>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+                  {processState.status === 'processing' ? (
+                    <div className="flex items-center gap-3">
+                      <Activity className="w-5 h-5 animate-pulse" />
+                      <span>PROCESANDO...</span>
+                    </div>
+                  ) : (
+                    <>
+                      <span>
+                        {mode === 'stego'
+                          ? (stegoAction === 'hide' ? 'CAMUFLAR AHORA' : 'EXTRAER AHORA')
+                          : (mode === 'encrypt' ? 'CIFRAR AHORA' : 'DESCIFRAR AHORA')}
+                      </span>
+                      <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                    </>
+                  )}
+
+                  {/* Button Glow Effect */}
+                  <div className={cn(
+                    "absolute inset-0 opacity-0 group-hover:opacity-20 transition-opacity",
+                    mode === 'encrypt' ? "bg-white" : "bg-brand-cyan"
+                  )} />
+                </button>
+              </div>
+
+              {/* Status Feedback */}
+              <AnimatePresence>
+                {processState.status !== 'idle' && processState.status !== 'processing' && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className={cn(
+                      "p-5 rounded-2xl flex items-start gap-4 text-sm border",
+                      processState.status === 'success' && "bg-brand-emerald/10 border-brand-emerald/20 text-brand-emerald",
+                      processState.status === 'error' && "bg-red-500/10 border-red-500/20 text-red-400"
+                    )}
+                  >
+                    {processState.status === 'success' ? <CheckCircle2 className="w-5 h-5 mt-0.5" /> : <XCircle className="w-5 h-5 mt-0.5" />}
+                    <div className="flex-1">
+                      <p className="font-bold uppercase text-[10px] tracking-widest mb-1">
+                        {processState.status === 'success' ? 'Resultado Exitoso' : 'Error del Sistema'}
+                      </p>
+                      <p className="opacity-80 leading-relaxed text-xs">{processState.message}</p>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
           </div>
 
           {/* Footer Info Bars */}
