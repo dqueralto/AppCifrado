@@ -14,11 +14,10 @@
     "windows": [
       {
         "title": "",
-        "width": 1150,
+        "width": 550,
         "height": 750,
-        "transparent": true,
-        "decorations": true,
-        "titleBarStyle": "Overlay"
+        "transparent": false,
+        "decorations": true
       }
     ],
     "security": {

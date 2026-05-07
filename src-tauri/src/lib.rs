@@ -20,15 +20,15 @@ pub fn run() {
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
 
-            // Ajustar al 85% del alto de la pantalla dinámicamente y ampliar ancho para el nuevo layout
+            // Ajustar al 90% del alto de la pantalla dinámicamente
             if let Ok(Some(monitor)) = window.primary_monitor() {
                 let size = monitor.size();
                 let scale_factor = monitor.scale_factor();
                 
-                // Calculamos el ancho físico (1150 logical -> physical para el nuevo diseño ancho)
-                let width = 1150.0 * scale_factor;
-                // Calculamos el alto al 85% de la pantalla física
-                let height = size.height as f64 * 0.85;
+                // Calculamos el ancho físico (550 logical -> physical)
+                let width = 550.0 * scale_factor;
+                // Calculamos el alto al 90% de la pantalla física
+                let height = size.height as f64 * 0.90;
                 
                 // Aplicamos el tamaño
                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
@@ -36,16 +36,12 @@ pub fn run() {
                     height: height as u32,
                 }));
 
-                // Centrar horizontal y verticalmente
+                // Centrar horizontal y verticalmente al inicio
                 let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
                     x: ((size.width as f64 - width) / 2.0) as i32,
                     y: ((size.height as f64 - height) / 2.0) as i32,
                 }));
             }
-
-            #[cfg(target_os = "macos")]
-            apply_vibrancy(&window, NSVisualEffectMaterial::UnderWindowBackground, None, None)
-                .expect("Unsupported platform! 'apply_vibrancy' is only supported on macOS");
 
             Ok(())
         })
