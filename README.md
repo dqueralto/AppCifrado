@@ -64,7 +64,7 @@ A diferencia de una base de datos relacional, el "Modelo de Datos" de CryptoBro 
 
 ## 🔐 4. Seguridad y Arquitectura de Defensas
 
-El sistema ha superado estrictas auditorías técnicas para mitigar ataques conocidos:
+El sistema ha superado **8 auditorías técnicas exhaustivas**, culminando en una fase de consolidación donde se blindaron las fugas de información por errores de I/O y se implementó el borrado seguro de grado militar. Estrategias implementadas:
 
 1. **Defensa contra Reutilización de Nonce**: AES-GCM es extremadamente vulnerable si se reutiliza un Nonce. La función `derive_block_nonce` utiliza el Nonce base y realiza una operación `XOR` con un contador de 64-bits que incrementa por cada bloque, garantizando unicidad criptográfica.
 2. **Cascada Simétrica**: Para proteger contra debilidades futuras en cualquier algoritmo único, los datos se comprimen con Gzip, se cifran primero con AES-256-GCM y luego se envuelven en una capa de ChaCha20-Poly1305.
@@ -106,8 +106,12 @@ Para copiar llaves públicas extensas, se reemplazó la función bloqueante `ale
 
 Para elevar la calidad del producto y mantener la "ilusión" de inmersión en un entorno ciberpunk/hacker de alta gama:
 
-- **Efecto Glassmorphism**: Componentes flotantes semi-transparentes (`backdrop-blur-3xl`, `bg-black/40`) sobre un fondo oscuro, para una estética premium.
-- **Micro-animaciones**: Uso extenso de `framer-motion` para cambios de tamaño de ventanas modales, transiciones entre modos de cifrado (Cifrar vs Descifrar) y toggles (Borrado Seguro).
+- **Paleta de Estados**:
+  - 🟣 **Morado (Cifrar)**: Representa la complejidad y el blindaje de datos.
+  - 🟢 **Verde (Descifrar)**: Indica éxito, acceso y libertad de la información.
+  - 🔵 **Cian (Ocultar)**: El color de la tecnología y el camuflaje digital.
+- **Micro-animaciones**: Uso extenso de `framer-motion` para cambios de tamaño de ventanas modales, transiciones entre modos de cifrado y toggles.
+- **Integración Nativa**: La ventana se adapta al **90% del alto** del monitor del usuario y se posiciona en el borde superior, utilizando la barra de título estándar del sistema operativo para un arrastre y control natural ("como cualquier otra app").
 - **Flujo Guiado de Ayuda**: Integración de una Modal de Guía (`showGuide`) que explica brevemente la diferencia entre los algoritmos simétricos y cuánticos sin salir de la app.
 - **Limpieza Automática**: Al completar una acción exitosa, la interfaz resetea automáticamente las contraseñas, llaves en uso y rutas para evitar derrames accidentales de datos (Data Spillage).
 
