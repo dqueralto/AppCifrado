@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
 
 // --- Protección contra fuerza bruta ---
 // Almacena el número de intentos fallidos y el momento del primer fallo.
@@ -172,7 +173,7 @@ fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> R
 #[tauri::command]
 pub fn save_contact(
     app: AppHandle,
-    password: String,
+    mut password: String,
     name: String,
     public_key: String,
 ) -> Result<(), String> {
@@ -187,13 +188,17 @@ pub fn save_contact(
     contacts.retain(|c| c.name != name);
     contacts.push(Contact { name, public_key });
 
-    encrypt_and_save(path, &password, &contacts)
+    let result = encrypt_and_save(path, &password, &contacts);
+    password.zeroize(); // Defensa RAM: Destruir contraseña de la libreta
+    result
 }
 
 #[tauri::command]
-pub fn delete_contact(app: AppHandle, password: String, name: String) -> Result<(), String> {
+pub fn delete_contact(app: AppHandle, mut password: String, name: String) -> Result<(), String> {
     let path = get_contacts_path(&app);
     let mut contacts = get_contacts(app.clone(), Some(password.clone()))?;
     contacts.retain(|c| c.name != name);
-    encrypt_and_save(path, &password, &contacts)
+    let result = encrypt_and_save(path, &password, &contacts);
+    password.zeroize(); // Defensa RAM: Destruir contraseña de la libreta
+    result
 }

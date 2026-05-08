@@ -268,7 +268,7 @@ export default function App() {
           });
 
           if (result.success) setProcessState({ status: 'success', message: result.message });
-          else setProcessState({ status: 'error', message: "Error al ocultar" });
+          else setProcessState({ status: 'error', message: result.message || "Error al ocultar" });
         } else {
           // Extraer vault de imagen
           outputPath = await save({
@@ -287,8 +287,11 @@ export default function App() {
           });
 
           if (result.success) setProcessState({ status: 'success', message: result.message });
-          else setProcessState({ status: 'error', message: "Error al extraer: No se encontraron datos" });
+          else setProcessState({ status: 'error', message: result.message || "Error al extraer: No se encontraron datos" });
         }
+        // Limpiar estados tras la operación para evitar reutilización accidental
+        setInputPath("");
+        setCarrierPath("");
         return;
       }
 
@@ -923,19 +926,21 @@ ${identity.dsa_priv}
                     >
                       Copiar Todas las Llaves (Backup)
                     </button>
+
+
                     <button
-                      onClick={() => {
-                        if (window.confirm("¿Estás seguro? Esto reemplazará tu identidad actual.")) {
-                          handleGenerateIdentity();
-                        }
+                      onClick={async () => {
+                        const ok = await ask("¿Estás seguro? Esto reemplazará tu identidad cuántica actual con una nueva.", { title: "Regenerar Identidad", kind: "warning" });
+                        if (ok) handleGenerateIdentity();
                       }}
                       className="flex-1 py-3 bg-white/5 border border-white/10 rounded-2xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-all text-white/60"
                     >
                       Regenerar Nueva Identidad
                     </button>
                     <button
-                      onClick={() => {
-                        if (window.confirm("¿Eliminar identidad de la memoria?")) {
+                      onClick={async () => {
+                        const ok = await ask("¿Eliminar la identidad cuántica de la memoria? Esta acción no se puede deshacer y no puedes recuperar las llaves si no las has guardado.", { title: "Eliminar Identidad", kind: "warning" });
+                        if (ok) {
                           setIdentity(null);
                           setShowIdentityModal(false);
                         }
@@ -1043,8 +1048,8 @@ ${identity.dsa_priv}
                       {contacts.map(c => (
                         <div
                           key={c.name}
-                          onClick={() => {
-                            navigator.clipboard.writeText(c.public_key);
+                          onClick={async () => {
+                            await copyToClipboard(c.public_key);
                             setCopiedContact(c.name);
                             setTimeout(() => setCopiedContact(null), 1500);
                           }}
@@ -1154,7 +1159,7 @@ ${identity.dsa_priv}
                     <div>
                       <h3 className="text-[10px] font-bold text-red-400 uppercase tracking-widest mb-1">Borrado Seguro (Shredding)</h3>
                       <p className="text-[11px] text-white/50 leading-snug">
-                        Al habilitar esta opción, el archivo original se sobrescribe con patrones aleatorios (basado en el estándar Gutmann) antes de ser eliminado, haciendo imposible su recuperación forense.
+                        Al habilitar esta opción, el archivo original se sobrescribe con <strong>3 pasadas</strong> (basado en el estándar <strong>DoD 5220.22-M</strong>: Ceros, Unos y Ruido aleatorio criptográfico) antes de ser eliminado, haciendo imposible su recuperación forense.
                       </p>
                     </div>
                   </div>

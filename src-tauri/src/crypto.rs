@@ -121,7 +121,8 @@ fn derive_block_nonce(base_nonce: &[u8; 12], block_index: u64) -> [u8; 12] {
 }
 
 /// Deriva claves simétricas a partir de una contraseña usando Argon2id (Zeroized memory)
-pub fn derive_keys(password: &str, salt: &[u8]) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
+/// Devuelve un Result para propagar errores limpios a la UI en lugar de hacer panic.
+pub fn derive_keys(password: &str, salt: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), String> {
     let config = Params::new(65536, 3, 4, None).expect("Parámetros de Argon2 inválidos");
 
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, config);
@@ -129,12 +130,12 @@ pub fn derive_keys(password: &str, salt: &[u8]) -> (Zeroizing<Vec<u8>>, Zeroizin
     let mut output = Zeroizing::new([0u8; 64]);
     argon2
         .hash_password_into(password.as_bytes(), salt, output.as_mut())
-        .expect("Fallo al derivar claves");
+        .map_err(|_| "Fallo al derivar claves (Argon2id): memoria insuficiente o parámetros inválidos".to_string())?;
 
-    (
+    Ok((
         Zeroizing::new(output[0..32].to_vec()),
         Zeroizing::new(output[32..64].to_vec()),
-    )
+    ))
 }
 
 /// Cifra un stream de datos en bloques con doble capa (AES-256-GCM + ChaCha20-Poly1305).
@@ -255,10 +256,12 @@ pub async fn encrypt_file(
     validate_path(&input_path)?;
     validate_path(&output_path)?;
 
-    let mut input_file = File::open(&input_path)
+    let input_file = File::open(&input_path)
         .map_err(|_| "Error al leer el archivo de origen. Comprueba los permisos o si existe.")?;
-    let mut output_file = File::create(&output_path)
+    let mut input_file = BufReader::new(input_file);
+    let output_file = File::create(&output_path)
         .map_err(|_| "Error al crear el archivo de destino en la ruta especificada.")?;
+    let mut output_file = BufWriter::new(output_file);
 
     // Generar Sal y Nonces (Vectores de Inicialización) aleatorios
     let mut salt = [0u8; SALT_SIZE];
@@ -288,7 +291,7 @@ pub async fn encrypt_file(
         .map_err(|_| "Fallo de I/O al escribir Nonce ChaCha")?;
 
     // Derivar claves a partir de la contraseña
-    let (aes_key, chacha_key) = derive_keys(&password, &salt);
+    let (aes_key, chacha_key) = derive_keys(&password, &salt)?;
     password.zeroize(); // Defensa: Borrado de contraseña maestra en memoria RAM
 
     let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error interno: Fallo al inicializar cifrador AES")?;
@@ -329,8 +332,9 @@ pub async fn decrypt_file(
 
     let mut input_file = File::open(&input_path)
         .map_err(|_| "Error al leer el archivo. Comprueba los permisos o si existe.")?;
-    let mut output_file =
+    let output_file =
         File::create(&output_path).map_err(|_| "Error al crear el archivo de destino.")?;
+    let mut output_file = BufWriter::new(output_file);
 
     // Leer Magic Bytes (Retrocompatibilidad con V0)
     let mut magic_buf = [0u8; 4];
@@ -363,8 +367,12 @@ pub async fn decrypt_file(
         .read_exact(&mut chacha_nonce_raw)
         .map_err(|_| "Archivo corrupto: Falta nonce ChaCha")?;
 
+    // Tras leer toda la cabecera (seek ya no es necesario), envolvemos en BufReader
+    // para que las lecturas del payload de datos sean eficientes.
+    let mut input_file = BufReader::new(input_file);
+
     // Re-derivar las mismas claves
-    let (aes_key, chacha_key) = derive_keys(&password, &salt);
+    let (aes_key, chacha_key) = derive_keys(&password, &salt)?;
     password.zeroize(); // Defensa: Borrado de contraseña maestra en memoria RAM
 
     let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error interno: Fallo al inicializar cifrador AES")?;
@@ -398,17 +406,27 @@ pub async fn decrypt_file(
 
 #[tauri::command]
 pub async fn generate_quantum_keys() -> Result<EncryptResponse, String> {
-    // 1. Generar par de llaves Kyber-1024 (Cifrado)
-    let (kem_sk, kem_pk) = MlKem1024::generate(&mut OsRng);
+    // Mover la generación de llaves a un hilo bloqueante para no congelar la UI.
+    // La criptografía post-cuántica es computacionalmente costosa y no debe
+    // ejecutarse en el hilo async del runtime de Tokio.
+    let (kem_pk_hex, kem_sk_hex, dsa_pk_hex, dsa_sk_hex) =
+        tokio::task::spawn_blocking(|| {
+            // 1. Generar par de llaves Kyber-1024 (Cifrado)
+            let (kem_sk, kem_pk) = MlKem1024::generate(&mut OsRng);
 
-    // 2. Generar par de llaves ML-DSA-65 (Firma)
-    let dsa_kp = MlDsaKeyPair::generate(ML_DSA_65).map_err(|_| "Error interno al generar llaves de firma cuántica")?;
+            // 2. Generar par de llaves ML-DSA-65 (Firma)
+            let dsa_kp = MlDsaKeyPair::generate(ML_DSA_65)
+                .map_err(|_| "Error interno al generar llaves de firma cuántica".to_string())?;
 
-    // Codificar todo en Hexadecimal
-    let kem_pk_hex = hex::encode(kem_pk.as_bytes());
-    let kem_sk_hex = hex::encode(kem_sk.as_bytes());
-    let dsa_pk_hex = hex::encode(dsa_kp.public_key());
-    let dsa_sk_hex = hex::encode(dsa_kp.private_key());
+            Ok::<_, String>((
+                hex::encode(kem_pk.as_bytes()),
+                hex::encode(kem_sk.as_bytes()),
+                hex::encode(dsa_kp.public_key()),
+                hex::encode(dsa_kp.private_key()),
+            ))
+        })
+        .await
+        .map_err(|_| "Error de hardware al generar llaves cuánticas".to_string())??;
 
     Ok(EncryptResponse {
         success: true,
@@ -514,7 +532,7 @@ pub async fn encrypt_with_quantum(
         .map_err(|_| "Error de I/O al escribir Nonce ChaCha")?;
 
     // Derivar claves a partir del secreto compartido
-    let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
+    let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt)?;
 
     let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice())
         .map_err(|_| "Error al inicializar cifrador AES")?;
@@ -793,7 +811,7 @@ pub async fn decrypt_with_quantum(
         .read_exact(&mut chacha_nonce_raw)
         .map_err(|_| "Archivo cuántico corrupto: falta nonce ChaCha")?;
 
-    let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt);
+    let (aes_key, chacha_key) = derive_keys(&shared_secret_hex, &salt)?;
     let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice())
         .map_err(|_| "Error al inicializar cifrador AES")?;
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice())
@@ -1014,8 +1032,11 @@ pub async fn hide_in_image(
     io::copy(&mut vault_file, &mut writer).map_err(|_| "Error de I/O al camuflar el contenedor.")?;
 
     writer.flush().map_err(|_| "Error de I/O al vaciar buffers del disco.")?;
+    // Seguridad: Forzar escritura física al disco antes de destruir el original.
+    // Sin sync_all(), el SO puede tener los datos en caché y un apagón causaría pérdida irrecuperable.
+    writer.get_mut().sync_all().map_err(|_| "Error de I/O al sincronizar disco antes del borrado seguro.")?;
 
-    // Prevención de rastro esteganográfico: Destruir el .vault original (Plausible Deniability)
+    // Prevención de rastro esteranográfico: Destruir el .vault original (Plausible Deniability)
     drop(vault_file);
     let _ = secure_shred(&vault_path);
 
