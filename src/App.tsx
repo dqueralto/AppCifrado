@@ -1,6 +1,6 @@
 import { useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Shield,
@@ -216,6 +216,16 @@ export default function App() {
     if (mode === 'stego' && !inputPath) {
       setProcessState({ status: 'error', message: "Selecciona primero el archivo .vault o la imagen" });
       return;
+    }
+
+    if (mode === 'decrypt' && cryptoMethod === 'quantum' && !verifierKey) {
+      const confirmed = await ask(
+        "No has aportado una llave de verificación (Firma Digital) para autenticar este archivo.\n\nEl sistema procederá a descifrarlo, pero no podremos garantizar que el archivo provenga de una fuente legítima o que no haya sido alterado por un tercero.\n\n¿Estás seguro de que deseas proceder a ciegas bajo tu propia responsabilidad?",
+        { title: "Advertencia Crítica: Descifrado sin Autenticar", kind: "warning" }
+      );
+      if (!confirmed) {
+        return;
+      }
     }
 
     setProcessState({ status: 'processing', message: mode === 'encrypt' ? "Asegurando..." : "Descifrando..." });
