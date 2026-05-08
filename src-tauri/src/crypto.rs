@@ -6,8 +6,6 @@ use argon2::{Argon2, Params};
 use chacha20poly1305::ChaCha20Poly1305;
 use dilithium::{MlDsaKeyPair, ML_DSA_65};
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use kem::{Decapsulate, Encapsulate};
 use ml_kem::{
     kem::DecapsulationKey, kem::EncapsulationKey, EncodedSizeUser, KemCore, MlKem1024,
@@ -428,7 +426,7 @@ pub async fn encrypt_with_quantum(
     input_path: String,
     output_path: String,
     mut public_key_hex: String,
-    mut signing_key_hex: Option<String>,
+    signing_key_hex: Option<String>,
     shred_original: bool,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
@@ -531,17 +529,18 @@ pub async fn encrypt_with_quantum(
             &chacha_cipher,
             &aes_nonce_raw,
             &chacha_nonce_raw,
-        )
-    }).await.map_err(|_| "Error de hardware aislando el cifrado cuántico")??;
-
-    // Finalizar escritura y asegurar en disco
-    output_file
-        .flush()
-        .map_err(|_| "Error de I/O al vaciar buffer")?;
-    output_file
-        .sync_all()
-        .map_err(|_| "Error de I/O al sincronizar disco")?;
-    drop(output_file);
+        )?;
+        
+        // Finalizar escritura y asegurar en disco dentro del mismo hilo bloqueante
+        output_file
+            .flush()
+            .map_err(|_| "Error de I/O al vaciar buffer".to_string())?;
+        output_file
+            .sync_all()
+            .map_err(|_| "Error de I/O al sincronizar disco".to_string())?;
+            
+        Ok::<(), String>(())
+    }).await.map_err(|_| "Error de hardware aislando el cifrado cuántico".to_string())??;
 
     // 5. Firma Digital con Hash Streaming (evita cargar el archivo completo en RAM)
     // BUG FIX #1: Antes usábamos `if parts.len() == 2` que ignoraba silenciosamente el error
@@ -631,7 +630,7 @@ pub async fn decrypt_with_quantum(
     input_path: String,
     output_path: String,
     mut private_key_hex: String,
-    mut verifier_key_hex: Option<String>,
+    verifier_key_hex: Option<String>,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
     validate_path(&output_path)?;

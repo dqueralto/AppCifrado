@@ -246,7 +246,10 @@ export default function App() {
             defaultPath: "secreto_oculto",
             filters: [{ name: 'Todos los archivos', extensions: ['*'] }]
           });
-          if (!outputPath) return;
+          if (!outputPath) {
+            setProcessState({ status: 'idle', message: "" });
+            return;
+          }
 
           const result: any = await invoke("hide_in_image", {
             imagePath: carrierPath,
@@ -263,7 +266,10 @@ export default function App() {
             defaultPath: "extraido.vault",
             filters: [{ name: 'Bóveda', extensions: ['vault'] }]
           });
-          if (!outputPath) return;
+          if (!outputPath) {
+            setProcessState({ status: 'idle', message: "" });
+            return;
+          }
 
           const result: any = await invoke("extract_from_image", {
             imagePath: inputPath,
