@@ -3,10 +3,6 @@
  * Centralizar aquí evita duplicación y asegura consistencia entre componentes.
  */
 
-export interface ProcessState {
-  status: 'idle' | 'processing' | 'success' | 'error'; // Estado actual del flujo de trabajo
-  message: string; // Mensaje descriptivo para el usuario
-}
 
 export interface Identity {
   kem_pub: string; // Llave pública ML-KEM-1024 (Encapsulación)

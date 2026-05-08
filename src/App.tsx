@@ -9,7 +9,6 @@ import {
   ChevronRight,
   Activity,
   CheckCircle2,
-  XCircle,
   ShieldAlert,
   Fingerprint,
   Zap,
@@ -19,10 +18,11 @@ import {
   Globe,
   Lock,
 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
-import type { ProcessState, Identity, Contact, AuthTarget } from "./types";
+import type { Identity, Contact, AuthTarget } from "./types";
+import { toast } from "./toast";
 import { SecurityGuideModal } from "./components/SecurityGuideModal";
 import { ReAuthModal } from "./components/ReAuthModal";
 import { GatekeeperModal } from "./components/GatekeeperModal";
@@ -48,7 +48,7 @@ export default function App() {
   const [showInitialWarning, setShowInitialWarning] = useState(true);
   const [showGatekeeper, setShowGatekeeper] = useState(false);
   const [isAppUnlocked, setIsAppUnlocked] = useState(false);
-  const [processState, setProcessState] = useState<ProcessState>({ status: 'idle', message: "" });
+  const [isProcessing, setIsProcessing] = useState(false);
   const clipboardTimeoutRef = useRef<number | null>(null);
   const [mode, setMode] = useState<'encrypt' | 'decrypt' | 'stego'>('encrypt');
   const [itemType, setItemType] = useState<'file' | 'folder'>('file');
@@ -66,7 +66,6 @@ export default function App() {
   const [authTarget, setAuthTarget] = useState<AuthTarget>(null);
   const [authInput, setAuthInput] = useState("");
   const [copiedContact, setCopiedContact] = useState<string | null>(null);
-  const [copiedToast, setCopiedToast] = useState(false);
   const [isLoadingContacts, setIsLoadingContacts] = useState(false);
 
   // Seguridad: Zeroize de Master Password por inactividad (15 min)
@@ -107,7 +106,7 @@ export default function App() {
   const loadContacts = async (pass?: string) => {
     const p = pass || contactsPassword;
     if (!p) {
-      setProcessState({ status: 'error', message: "Introduce la contraseña de la libreta" });
+      toast.error("Introduce la contraseña de la libreta");
       return;
     }
     setIsLoadingContacts(true);
@@ -115,7 +114,7 @@ export default function App() {
       const list: any = await invoke("get_contacts", { password: p });
       setContacts(list);
     } catch (err) {
-      setProcessState({ status: 'error', message: String(err) });
+      toast.error(String(err));
       setContacts([]);
     } finally {
       setIsLoadingContacts(false);
@@ -137,11 +136,12 @@ export default function App() {
         verifierKey: contact.verifierKey || ""
       });
       await loadContacts(contactsPassword);
-      return true; // Éxito
+      toast.success("Contacto guardado de forma segura");
+      return true;
     } catch (err) {
-      setProcessState({ status: 'error', message: String(err) });
-      setIsLoadingContacts(false); // loadContacts ya pone false en finally
-      return false; // Error
+      toast.error(String(err));
+      setIsLoadingContacts(false);
+      return false;
     }
   };
 
@@ -154,8 +154,9 @@ export default function App() {
     try {
       await invoke("delete_contact", { password: contactsPassword, name });
       await loadContacts(contactsPassword);
+      toast.success("Contacto eliminado");
     } catch (err) {
-      setProcessState({ status: 'error', message: String(err) });
+      toast.error(String(err));
       setIsLoadingContacts(false);
     }
   };
@@ -179,8 +180,7 @@ export default function App() {
     }
     
     if (success) {
-      setCopiedToast(true);
-      setTimeout(() => setCopiedToast(false), 2000);
+      toast.success("Copiado al portapapeles");
     }
 
     // Limpieza automática del portapapeles tras 10 segundos por seguridad
@@ -197,6 +197,7 @@ export default function App() {
   };
 
   const handleGenerateIdentity = async () => {
+    const tid = toast.loading("Generando Identidad Cuántica (ML-KEM + ML-DSA)...");
     try {
       const result: any = await invoke("generate_quantum_keys");
       if (result.success && result.data) {
@@ -204,9 +205,12 @@ export default function App() {
         setIdentity({ kem_pub: kp, kem_priv: ks, dsa_pub: dp, dsa_priv: ds });
         setShowKeyGuide(false);
         setShowIdentityModal(true);
+        toast.success("Identidad generada con éxito", { id: tid });
+      } else {
+        toast.error("Fallo al generar la identidad", { id: tid });
       }
     } catch (err: any) {
-      setProcessState({ status: 'error', message: "Error al generar identidad: " + err.toString() });
+      toast.error("Error al generar identidad: " + err.toString(), { id: tid });
     }
   };
 
@@ -218,7 +222,6 @@ export default function App() {
     });
     if (selected) {
       setInputPath(selected as string);
-      setProcessState({ status: 'idle', message: "" });
     }
   };
 
@@ -243,12 +246,12 @@ export default function App() {
   const runOperation = async () => {
     const secret = cryptoMethod === 'password' ? password : quantumKey;
     if (mode !== 'stego' && (!inputPath || !secret)) {
-      setProcessState({ status: 'error', message: "Se requiere archivo/carpeta y llave/contraseña" });
+      toast.error("Se requiere archivo/carpeta y llave/contraseña");
       return;
     }
 
     if (mode === 'stego' && !inputPath) {
-      setProcessState({ status: 'error', message: "Selecciona primero el archivo .vault o la imagen" });
+      toast.error("Selecciona primero el archivo .vault o la imagen");
       return;
     }
 
@@ -262,7 +265,7 @@ export default function App() {
       }
     }
 
-    setProcessState({ status: 'processing', message: mode === 'encrypt' ? "Asegurando..." : "Descifrando..." });
+    setIsProcessing(true);
 
     try {
       let outputPath: string | null = "";
@@ -270,7 +273,8 @@ export default function App() {
       if (mode === 'stego') {
         if (stegoAction === 'hide') {
           if (!carrierPath) {
-            setProcessState({ status: 'error', message: "Se requiere un archivo de camuflaje" });
+            toast.error("Se requiere un archivo de camuflaje");
+            setIsProcessing(false);
             return;
           }
 
@@ -292,10 +296,11 @@ export default function App() {
             filters: [{ name: 'Todos los archivos', extensions: ['*'] }]
           });
           if (!outputPath) {
-            setProcessState({ status: 'idle', message: "" });
+            setIsProcessing(false);
             return;
           }
 
+          const tid = toast.loading("Ocultando contenedor...");
           const result: any = await invoke("hide_in_image", {
             imagePath: carrierPath,
             vaultPath: inputPath,
@@ -303,10 +308,9 @@ export default function App() {
           });
 
           if (result.success) {
-            setProcessState({ status: 'success', message: result.message });
-            setTimeout(() => setProcessState(prev => prev.status === 'success' ? { status: 'idle', message: "" } : prev), 4000);
+            toast.success(result.message, { id: tid });
           } else {
-            setProcessState({ status: 'error', message: result.message || "Error al ocultar" });
+            toast.error(result.message || "Error al ocultar", { id: tid });
           }
         } else {
           // Extraer vault de imagen
@@ -316,22 +320,23 @@ export default function App() {
             filters: [{ name: 'Bóveda', extensions: ['vault'] }]
           });
           if (!outputPath) {
-            setProcessState({ status: 'idle', message: "" });
+            setIsProcessing(false);
             return;
           }
 
+          const tid = toast.loading("Extrayendo contenedor...");
           const result: any = await invoke("extract_from_image", {
             imagePath: inputPath,
             outputVaultPath: outputPath
           });
 
           if (result.success) {
-            setProcessState({ status: 'success', message: result.message });
-            setTimeout(() => setProcessState(prev => prev.status === 'success' ? { status: 'idle', message: "" } : prev), 4000);
+            toast.success(result.message, { id: tid });
           } else {
-            setProcessState({ status: 'error', message: result.message || "Error al extraer: No se encontraron datos" });
+            toast.error(result.message || "Error al extraer: No se encontraron datos", { id: tid });
           }
         }
+        setIsProcessing(false);
         // Limpiar estados tras la operación para evitar reutilización accidental
         setInputPath("");
         setCarrierPath("");
@@ -353,7 +358,7 @@ export default function App() {
       }
 
       if (!outputPath) {
-        setProcessState({ status: 'idle', message: "" });
+        setIsProcessing(false);
         return;
       }
 
@@ -394,18 +399,24 @@ export default function App() {
         args.shredOriginal = shredOriginal;
       }
 
-      const result: any = await invoke(command, args);
+      const tid = toast.loading(mode === 'encrypt' ? "Asegurando..." : "Descifrando...");
+      
+      try {
+        const result: any = await invoke(command, args);
 
-      if (result.success) {
-        setProcessState({ status: 'success', message: result.message });
-        setInputPath("");
-        setTimeout(() => setProcessState(prev => prev.status === 'success' ? { status: 'idle', message: "" } : prev), 4000);
-      } else {
-        setProcessState({ status: 'error', message: "Operación fallida" });
+        if (result.success) {
+          toast.success(result.message, { id: tid });
+          setInputPath("");
+        } else {
+          toast.error("Operación fallida", { id: tid });
+        }
+      } catch (err: any) {
+        toast.error(err.toString(), { id: tid });
       }
     } catch (err: any) {
-      setProcessState({ status: 'error', message: err.toString() });
+      toast.error(err.toString());
     } finally {
+      setIsProcessing(false);
       // Seguridad Zero-Trust: Destrucción de secretos de la RAM de V8 y DOM 
       // tras cada operación para evitar que queden expuestos si el usuario se ausenta.
       setPassword("");
@@ -421,8 +432,9 @@ export default function App() {
       await invoke("get_contacts", { password: contactsPassword });
       setIsAppUnlocked(true);
       setShowGatekeeper(false);
+      toast.success("Bóveda desbloqueada");
     } catch (err: any) {
-      setProcessState({ status: 'error', message: err.toString() });
+      toast.error(err.toString());
     }
   };
 
@@ -436,7 +448,7 @@ export default function App() {
       setAuthTarget(null);
       setAuthInput("");
     } else {
-      setProcessState({ status: 'error', message: "Contraseña incorrecta" });
+      toast.error("Contraseña incorrecta");
       setAuthInput("");
     }
   };
@@ -754,7 +766,7 @@ export default function App() {
             <div className="pt-2">
               <button
                 disabled={
-                  processState.status === 'processing' ||
+                  isProcessing ||
                   (!inputPath) ||
                   (mode !== 'stego' && cryptoMethod === 'password' && !password) ||
                   (mode !== 'stego' && cryptoMethod === 'quantum' && !quantumKey) ||
@@ -768,10 +780,10 @@ export default function App() {
                     : mode === 'decrypt'
                       ? "bg-brand-emerald text-black"
                       : "bg-brand-cyan text-black",
-                  processState.status === 'processing' && "opacity-50 cursor-wait"
+                  isProcessing && "opacity-50 cursor-wait"
                 )}
               >
-                {processState.status === 'processing' ? (
+                {isProcessing ? (
                   <div className="flex flex-col items-center gap-1 w-full px-6">
                     <div className="flex items-center gap-3">
                       <Activity className="w-5 h-5 animate-spin" />
@@ -805,30 +817,6 @@ export default function App() {
                 )} />
               </button>
             </div>
-
-            {/* Panel de Feedback de Estado (Éxito/Error) */}
-            <AnimatePresence>
-              {processState.status !== 'idle' && processState.status !== 'processing' && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  className={cn(
-                    "p-5 rounded-2xl flex items-start gap-4 text-sm border",
-                    processState.status === 'success' && "bg-brand-emerald/10 border-brand-emerald/20 text-brand-emerald",
-                    processState.status === 'error' && "bg-red-500/10 border-red-500/20 text-red-400"
-                  )}
-                >
-                  {processState.status === 'success' ? <CheckCircle2 className="w-5 h-5 mt-0.5" /> : <XCircle className="w-5 h-5 mt-0.5" />}
-                  <div className="flex-1">
-                    <p className="font-bold uppercase text-[10px] tracking-widest mb-1">
-                      {processState.status === 'success' ? 'Resultado Exitoso' : 'Error del Sistema'}
-                    </p>
-                    <p className="opacity-80 leading-relaxed text-xs">{processState.message}</p>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
           </div>
 
           {/* Barras de Información del Pie (Métodos Activos) */}
@@ -852,20 +840,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Toast de copiado */}
-        <AnimatePresence>
-          {copiedToast && (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              className="fixed bottom-6 right-6 z-50 bg-brand-emerald/90 text-black text-xs font-bold px-5 py-3 rounded-2xl shadow-2xl backdrop-blur-md flex items-center gap-2"
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              Copiado al portapapeles
-            </motion.div>
-          )}
-        </AnimatePresence>
+
 
         <IdentityModal
           show={showIdentityModal}
