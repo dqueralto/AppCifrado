@@ -78,6 +78,7 @@ El sistema ha superado **18 auditorías técnicas exhaustivas**, culminando en u
 8. **Escudo Anti-OOM (Out of Memory)**: El motor de Rust impone límites físicos estrictos (máximo 20,000 caracteres) a las llaves pegadas desde el portapapeles, evitando colapsos del sistema por saturación de memoria.
 9. **Portapapeles Seguro**: Las llaves copiadas se eliminan automáticamente del portapapeles del sistema operativo tras 10 segundos para prevenir el espionaje por otras aplicaciones.
 10. **Política de Seguridad de Contenido (CSP)**: El frontend opera bajo un CSP estricto (`default-src 'self'`) que bloquea XSS y exfiltración de datos.
+11. **Advertencia de Descifrado Ciego**: Para evitar ataques de manipulación de archivos que pasen desapercibidos, el sistema lanza una alerta de confirmación nativa si el usuario intenta descifrar un contenedor cuántico sin aportar una llave de verificación (ML-DSA). Esto obliga al usuario a aceptar explícitamente el riesgo de procesar datos no autenticados.
 
 ---
 
