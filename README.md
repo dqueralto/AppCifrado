@@ -23,9 +23,15 @@ La aplicación utiliza la arquitectura **Tauri** (Frontend web interactivo + Bac
 
 ```text
 /src                      # FRONTEND (React)
- ├── /components          # Componentes UI (no usado extensivamente, lógica en App.tsx)
- ├── App.tsx              # Orquestador principal, lógica de estados y UI centralizada
- ├── index.css            # Design System (Tailwind base y clases de utilidad)
+ ├── /components          # Componentes UI Modulares y Desacoplados
+ │    ├── GatekeeperModal.tsx    # Gestión de acceso inicial
+ │    ├── ReAuthModal.tsx        # Verificación estricta para secretos
+ │    ├── IdentityModal.tsx      # Gestión de llaves PQC (KEM/DSA)
+ │    ├── ContactsModal.tsx      # Agenda cifrada de contactos
+ │    └── SecurityGuideModal.tsx # Documentación interactiva
+ ├── App.tsx              # Orquestador principal y gestión de estados globales
+ ├── types.ts             # Definiciones de tipos compartidas
+ ├── index.css            # Design System avanzado
  └── main.tsx             # Punto de entrada de React
 
 /src-tauri/src            # BACKEND (Rust)
@@ -56,9 +62,11 @@ A diferencia de una base de datos relacional, el "Modelo de Datos" de CryptoBro 
 | :--- | :--- | :--- |
 | `0x00` | 4 bytes | Magic Bytes (`CBRO`). |
 | `0x04` | 1 byte | Vault ID (`1` = KEM, `2` = KEM + Firma Digital). |
-| `0x05` | 3309 bytes | (Solo si ID = 2) Firma ML-DSA-65. |
-| `0xCF2`| 1568 bytes | Ciphertext encapsulado de ML-KEM-1024. |
-| `...`  | Variable | Flags, Sal, Nonces y Payload cifrado (igual al Estándar). |
+| `0x05` | 3309 bytes | (Solo si ID = 2) Firma **ML-DSA-65**. Protege la integridad del payload. |
+| `0xCF2`| 1568 bytes | Ciphertext encapsulado de **ML-KEM-1024**. |
+| `...`  | Variable | Flags, Sal, Nonces y Payload cifrado (Cifrado en Cascada). |
+
+*Nota: Todos los offsets y tamaños están ahora gestionados mediante constantes globales (`ML_DSA_65_SIG_SIZE`, etc.) para garantizar la mantenibilidad.*
 
 ---
 
@@ -72,12 +80,12 @@ El sistema ha superado **18 auditorías técnicas exhaustivas**, culminando en u
 4. **Blindaje de Memoria (Zeroization)**: Implementación de la política de *Cero Persistencia en RAM*.
    - **Backend**: Todas las contraseñas y llaves cuánticas son mutables y se sobrescriben físicamente con ceros (`.zeroize()`) milisegundos después de su uso.
    - **Frontend**: Los estados de React se limpian incondicionalmente (bloque `finally`) tras cada operación, forzando al recolector de basura de V8 a eliminar secretos del heap de la ventana.
-5. **Transacciones Atómicas**: Si una operación de descifrado falla (datos corruptos o llave incorrecta), el sistema ejecuta un "botón de pánico" que destruye automáticamente el archivo parcial resultante mediante borrado seguro, evitando fugas de texto plano no autenticado (*Unauthenticated Plaintext Release*).
+5. **Escritura Atómica y HashingWriter**: Para resolver la vulnerabilidad de firmas no atómicas (Bug #2), se ha implementado un wrapper `HashingWriter` que calcula el hash SHA-256 del payload *al vuelo* durante la escritura. La firma digital se inyecta ahora **dentro del mismo bloque de escritura bloqueante** antes de llamar a `sync_all()`, garantizando que un archivo nunca quede en disco sin su firma correspondiente ante un fallo de energía o proceso.
 6. **Borrado Seguro (Secure Shredding)**: Implementa el estándar **DoD 5220.22-M**. CryptoBro sobrescribe archivos mediante 3 pasadas exhaustivas (Ceros, Unos y Ruido criptográfico). Para carpetas, el borrado es **recursivo**: se tritura cada archivo individualmente antes de eliminar el directorio raíz.
 7. **Negación Plausible en Stego**: Al ocultar un contenedor en una imagen, el sistema tritura automáticamente el archivo `.vault` original tras la inyección exitosa, eliminando cualquier rastro forense de la operación.
 8. **Escudo Anti-OOM (Out of Memory)**: El motor de Rust impone límites físicos estrictos (máximo 20,000 caracteres) a las llaves pegadas desde el portapapeles, evitando colapsos del sistema por saturación de memoria.
 9. **Portapapeles Seguro**: Las llaves copiadas se eliminan automáticamente del portapapeles del sistema operativo tras 10 segundos para prevenir el espionaje por otras aplicaciones.
-10. **Política de Seguridad de Contenido (CSP)**: El frontend opera bajo un CSP estricto (`default-src 'self'`) que bloquea XSS y exfiltración de datos.
+10. **Arquitectura Zero-Knowledge Modular**: El frontend se ha desacoplado en componentes funcionales (`Gatekeeper`, `Identity`, `Contacts`). La comunicación entre ellos se realiza mediante estados atómicos y callbacks, minimizando la superficie de exposición de secretos en el componente raíz.
 11. **Advertencia de Descifrado Ciego**: Para evitar ataques de manipulación de archivos que pasen desapercibidos, el sistema lanza una alerta de confirmación nativa si el usuario intenta descifrar un contenedor cuántico sin aportar una llave de verificación (ML-DSA). Esto obliga al usuario a aceptar explícitamente el riesgo de procesar datos no autenticados.
 
 ---
@@ -88,8 +96,8 @@ CryptoBro está diseñado para manejar **archivos de varios gigabytes** sin cola
 
 ### A. Cifrado / Descifrado en Multihilo (`crypto.rs`)
 En lugar de bloquear el hilo principal, el motor utiliza `tokio::task::spawn_blocking` para mover las operaciones pesadas de I/O a un pool de hilos dedicado. Esto permite que la interfaz de usuario permanezca fluida a 60 FPS incluso durante el cifrado de archivos de varios gigabytes. 
-- **Streaming**: Se utiliza un bucle con `CHUNK_SIZE = 64KB`. Cada bloque se procesa de forma independiente para mantener un uso de RAM constante e ínfimo.
-- **Inyección de Firmas**: Para las firmas digitales, se emplea una inserción quirúrgica con `SeekFrom::Start(5)`, sobrescribiendo únicamente los `3309 bytes` correspondientes sin recargar el archivo en memoria.
+- **Streaming y Atomicidad**: Se utiliza un bucle con `CHUNK_SIZE = 64KB`. Cada bloque se procesa de forma independiente. Gracias al `HashingWriter`, el hash para la firma se genera sin lecturas adicionales del disco.
+- **Inyección de Firmas**: La firma digital se calcula al final del streaming y se inyecta mediante `SeekFrom::Start` antes de cerrar el descriptor de archivo, garantizando integridad atómica (Protocolo Anti-Corrupción).
 
 ### B. Esteganografía Inteligente
 CryptoBro puede ocultar archivos `.vault` dentro de archivos multimedia normales (MKV, PDF, PNG) concatenándolos detrás del marcador `CRYPTOBRO_HIDDEN_DATA_V1`.

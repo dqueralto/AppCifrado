@@ -1,14 +1,12 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Shield,
-  Lock,
   Unlock,
   FileText,
   ChevronRight,
-  Cpu,
   Activity,
   CheckCircle2,
   XCircle,
@@ -17,32 +15,22 @@ import {
   Zap,
   Key,
   Users,
-  Trash2,
   HelpCircle,
-  Info,
-  Layers,
   Globe,
-  FileCode2,
-  AlertTriangle
+  Lock,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import type { ProcessState, Identity, Contact, AuthTarget } from "./types";
+import { SecurityGuideModal } from "./components/SecurityGuideModal";
+import { ReAuthModal } from "./components/ReAuthModal";
+import { GatekeeperModal } from "./components/GatekeeperModal";
+import { IdentityModal } from "./components/IdentityModal";
+import { ContactsModal } from "./components/ContactsModal";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
-}
-
-interface ProcessState {
-  status: 'idle' | 'processing' | 'success' | 'error';
-  message: string;
-}
-
-interface Identity {
-  kem_pub: string;
-  kem_priv: string;
-  dsa_pub: string;
-  dsa_priv: string;
 }
 
 export default function App() {
@@ -58,6 +46,8 @@ export default function App() {
   const [verifierKey, setVerifierKey] = useState("");
   const [inputPath, setInputPath] = useState("");
   const [showInitialWarning, setShowInitialWarning] = useState(true);
+  const [showGatekeeper, setShowGatekeeper] = useState(false);
+  const [isAppUnlocked, setIsAppUnlocked] = useState(false);
   const [processState, setProcessState] = useState<ProcessState>({ status: 'idle', message: "" });
   const clipboardTimeoutRef = useRef<number | null>(null);
   const [mode, setMode] = useState<'encrypt' | 'decrypt' | 'stego'>('encrypt');
@@ -65,71 +55,115 @@ export default function App() {
   const [cryptoMethod, setCryptoMethod] = useState<'password' | 'quantum'>('password');
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [shredOriginal, setShredOriginal] = useState(false);
-  const [contacts, setContacts] = useState<{ name: string, public_key: string }[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
   const [showContacts, setShowContacts] = useState(false);
-  const [newContact, setNewContact] = useState({ name: "", key: "" });
   const [stegoAction, setStegoAction] = useState<'hide' | 'extract'>('hide');
   const [showGuide, setShowGuide] = useState(false);
   const [showKeyGuide, setShowKeyGuide] = useState(false);
   const [showIdentityModal, setShowIdentityModal] = useState(false);
   const [carrierPath, setCarrierPath] = useState("");
-  const [contactsPassword, setContactsPassword] = useState(""); // Contraseña de la libreta
-  const [isContactsUnlocked, setIsContactsUnlocked] = useState(false); // Estado de desbloqueo
-  const [copiedContact, setCopiedContact] = useState<string | null>(null); // Para feedback de copia
-  const [copiedToast, setCopiedToast] = useState(false); // Toast de copiado en portapapeles
+  const [contactsPassword, setContactsPassword] = useState("");
+  const [authTarget, setAuthTarget] = useState<AuthTarget>(null);
+  const [authInput, setAuthInput] = useState("");
+  const [copiedContact, setCopiedContact] = useState<string | null>(null);
+  const [copiedToast, setCopiedToast] = useState(false);
+  const [isLoadingContacts, setIsLoadingContacts] = useState(false);
 
-  // Función segura para cerrar la libreta: borra SIEMPRE el estado de autenticación.
-  // Esto garantiza que cada apertura del modal requiere contraseña, sin importar
-  // si la app fue minimizada, el modal fue cerrado o se vuelve a abrir en la misma sesión.
+  // Seguridad: Zeroize de Master Password por inactividad (15 min)
+  useEffect(() => {
+    if (!isAppUnlocked) return;
+
+    let lastActivity = Date.now();
+    const updateActivity = () => { lastActivity = Date.now(); };
+
+    // Usamos { passive: true } para no bloquear el hilo de renderizado
+    window.addEventListener('mousemove', updateActivity, { passive: true });
+    window.addEventListener('keydown', updateActivity, { passive: true });
+
+    const interval = setInterval(() => {
+      if (Date.now() - lastActivity > 15 * 60 * 1000) {
+        setIsAppUnlocked(false);
+        setContactsPassword("");
+        setShowGatekeeper(true);
+      }
+    }, 10000); // Comprobación cada 10 segundos
+
+    return () => {
+      window.removeEventListener('mousemove', updateActivity);
+      window.removeEventListener('keydown', updateActivity);
+      clearInterval(interval);
+    };
+  }, [isAppUnlocked]);
+
   const closeContacts = () => {
     setShowContacts(false);
-    setIsContactsUnlocked(false);
-    setContactsPassword("");
     setContacts([]);
   };
 
+  /**
+   * Carga la lista de contactos desde el almacenamiento cifrado.
+   * Requiere la contraseña maestra para derivar la llave de descifrado AES.
+   */
   const loadContacts = async (pass?: string) => {
     const p = pass || contactsPassword;
-    // Seguridad: nunca intentar cargar sin contraseña
     if (!p) {
       setProcessState({ status: 'error', message: "Introduce la contraseña de la libreta" });
       return;
     }
+    setIsLoadingContacts(true);
     try {
       const list: any = await invoke("get_contacts", { password: p });
       setContacts(list);
-      setIsContactsUnlocked(true);
     } catch (err) {
       setProcessState({ status: 'error', message: String(err) });
-      setIsContactsUnlocked(false);
       setContacts([]);
+    } finally {
+      setIsLoadingContacts(false);
     }
   };
 
-  const handleAddContact = async () => {
-    if (!newContact.name || !newContact.key || !contactsPassword) return;
+  /**
+   * Añade un nuevo contacto a la libreta cifrada.
+   * Realiza un Zeroize implícito de la contraseña tras la operación en el backend.
+   */
+  const handleAddContact = async (contact: { name: string; key: string; verifierKey: string }) => {
+    if (!contact.name || !contact.key || !contactsPassword || isLoadingContacts) return false;
+    setIsLoadingContacts(true);
     try {
       await invoke("save_contact", {
         password: contactsPassword,
-        name: newContact.name,
-        publicKey: newContact.key
+        name: contact.name,
+        publicKey: contact.key,
+        verifierKey: contact.verifierKey || ""
       });
-      setNewContact({ name: "", key: "" });
-      loadContacts();
+      await loadContacts(contactsPassword);
+      return true; // Éxito
     } catch (err) {
       setProcessState({ status: 'error', message: String(err) });
+      setIsLoadingContacts(false); // loadContacts ya pone false en finally
+      return false; // Error
     }
   };
 
+  /**
+   * Elimina un contacto por su nombre único.
+   */
   const handleDeleteContact = async (name: string) => {
+    if (isLoadingContacts) return;
+    setIsLoadingContacts(true);
     try {
       await invoke("delete_contact", { password: contactsPassword, name });
-      loadContacts();
+      await loadContacts(contactsPassword);
     } catch (err) {
       setProcessState({ status: 'error', message: String(err) });
+      setIsLoadingContacts(false);
     }
   };
 
+  /**
+   * Copia texto al portapapeles con fallback para navegadores antiguos
+   * y limpieza automática programada.
+   */
   const copyToClipboard = async (text: string) => {
     let success = false;
     try {
@@ -140,7 +174,7 @@ export default function App() {
         await navigator.clipboard.writeText(text);
         success = true;
       } catch (err2) {
-        console.error("Clipboard Error:", err2);
+        console.error("Error del Portapapeles:", err2);
       }
     }
     
@@ -149,7 +183,7 @@ export default function App() {
       setTimeout(() => setCopiedToast(false), 2000);
     }
 
-    // Auto-clear clipboard after 10 seconds for security
+    // Limpieza automática del portapapeles tras 10 segundos por seguridad
     if (clipboardTimeoutRef.current) {
       window.clearTimeout(clipboardTimeoutRef.current);
     }
@@ -241,14 +275,15 @@ export default function App() {
           }
 
           /* 
-           * PQC IMPLEMENTATION - STEP 1 (ENCAPSULACIÓN):
-           * Encapsular usando ML-KEM-1024 (FIPS 203).
-           * Genera un secreto compartido y un texto cifrado que solo el dueño de la llave privada puede abrir.
-           * let (ciphertext, shared_secret) = pk.encapsulate(&mut OsRng);
+           * IMPLEMENTACIÓN PQC - PASO 1 (ENCAPSULACIÓN):
+           * Se encapsula una clave compartida usando ML-KEM-1024 (FIPS 203).
+           * Esto genera un secreto compartido y un texto cifrado que solo el poseedor 
+           * de la llave privada correspondiente podrá decapsular.
+           * Ejemplo lógico: let (ciphertext, shared_secret) = pk.encapsulate(&mut OsRng);
            *
-           * PQC IMPLEMENTATION - STEP 2 (DERIVACIÓN):
-           * El secreto compartido generado por ML-KEM es la semilla de entropía para derivar 
-           * nuestras llaves simétricas (AES+ChaCha).
+           * IMPLEMENTACIÓN PQC - PASO 2 (DERIVACIÓN):
+           * El secreto compartido de ML-KEM sirve como semilla de entropía para derivar 
+           * las llaves simétricas finales (AES-256-GCM + ChaCha20-Poly1305).
            */
 
           outputPath = await save({
@@ -267,8 +302,12 @@ export default function App() {
             outputPath
           });
 
-          if (result.success) setProcessState({ status: 'success', message: result.message });
-          else setProcessState({ status: 'error', message: result.message || "Error al ocultar" });
+          if (result.success) {
+            setProcessState({ status: 'success', message: result.message });
+            setTimeout(() => setProcessState(prev => prev.status === 'success' ? { status: 'idle', message: "" } : prev), 4000);
+          } else {
+            setProcessState({ status: 'error', message: result.message || "Error al ocultar" });
+          }
         } else {
           // Extraer vault de imagen
           outputPath = await save({
@@ -286,8 +325,12 @@ export default function App() {
             outputVaultPath: outputPath
           });
 
-          if (result.success) setProcessState({ status: 'success', message: result.message });
-          else setProcessState({ status: 'error', message: result.message || "Error al extraer: No se encontraron datos" });
+          if (result.success) {
+            setProcessState({ status: 'success', message: result.message });
+            setTimeout(() => setProcessState(prev => prev.status === 'success' ? { status: 'idle', message: "" } : prev), 4000);
+          } else {
+            setProcessState({ status: 'error', message: result.message || "Error al extraer: No se encontraron datos" });
+          }
         }
         // Limpiar estados tras la operación para evitar reutilización accidental
         setInputPath("");
@@ -356,16 +399,45 @@ export default function App() {
       if (result.success) {
         setProcessState({ status: 'success', message: result.message });
         setInputPath("");
+        setTimeout(() => setProcessState(prev => prev.status === 'success' ? { status: 'idle', message: "" } : prev), 4000);
       } else {
         setProcessState({ status: 'error', message: "Operación fallida" });
       }
     } catch (err: any) {
       setProcessState({ status: 'error', message: err.toString() });
     } finally {
-      // Defensa de Estado: Destrucción de secretos del DOM / V8 Memory
+      // Seguridad Zero-Trust: Destrucción de secretos de la RAM de V8 y DOM 
+      // tras cada operación para evitar que queden expuestos si el usuario se ausenta.
       setPassword("");
       setQuantumKey("");
       setVerifierKey("");
+    }
+  };
+
+  // Eliminamos la duplicación de lógica de Gatekeeper (Bug #11 de auditoría)
+  const handleGatekeeperUnlock = async () => {
+    if (!contactsPassword) return;
+    try {
+      await invoke("get_contacts", { password: contactsPassword });
+      setIsAppUnlocked(true);
+      setShowGatekeeper(false);
+    } catch (err: any) {
+      setProcessState({ status: 'error', message: err.toString() });
+    }
+  };
+
+  // Eliminamos la duplicación de lógica de Re-Auth (Bug #12 de auditoría)
+  const handleReAuthVerify = () => {
+    if (authInput === contactsPassword) {
+      if (authTarget === 'keys') {
+        if (identity) setShowIdentityModal(true);
+        else handleGenerateIdentity();
+      }
+      setAuthTarget(null);
+      setAuthInput("");
+    } else {
+      setProcessState({ status: 'error', message: "Contraseña incorrecta" });
+      setAuthInput("");
     }
   };
 
@@ -377,10 +449,10 @@ export default function App() {
         animate={{ opacity: 1, scale: 1 }}
         className="w-full max-w-lg relative"
       >
-        {/* Main Glass Card */}
+        {/* Tarjeta Principal con Efecto Glassmorphism */}
         <div className="bg-black/40 backdrop-blur-3xl border border-white/10 rounded-[32px] shadow-2xl overflow-hidden">
 
-          {/* Header Section */}
+          {/* Sección de Cabecera: Logo y Estado de Identidad */}
           <div className="p-8 pb-0 flex flex-col items-center text-center">
             <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-brand-cyan/20 to-brand-violet/20 flex items-center justify-center border border-white/10 mb-6 shadow-inner">
               <Shield className="w-10 h-10 text-brand-cyan" />
@@ -398,7 +470,7 @@ export default function App() {
                   <HelpCircle className="w-3 h-3" /> Guía
                 </button>
                 <button
-                  onClick={() => { setShowContacts(true); }}
+                  onClick={() => { setShowContacts(true); loadContacts(contactsPassword); }}
                   className="text-[10px] font-bold text-white/40 uppercase tracking-tighter hover:text-brand-cyan transition-colors flex items-center gap-1"
                 >
                   <Users className="w-3 h-3" /> Contactos
@@ -520,10 +592,10 @@ export default function App() {
             )}
           </div>
 
-          {/* Interaction Area */}
+          {/* Área de Interacción Principal */}
           <div className="p-8 space-y-6">
 
-            {/* File Dropzone */}
+            {/* Zona de Selección de Archivos (Dropzone) */}
             <div className="space-y-4">
               <div className={cn(
                 "group relative overflow-hidden rounded-[24px] border-2 border-dashed transition-all duration-500",
@@ -578,7 +650,7 @@ export default function App() {
               )}
             </div>
 
-            {/* Secret Input */}
+            {/* Entrada de Secreto (Contraseña o Llave PQC) */}
             {mode !== 'stego' && (
               <div className="space-y-4">
                 <div className="flex justify-between items-center px-1">
@@ -644,7 +716,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Options */}
+            {/* Opciones Adicionales (Borrado Seguro) */}
             {mode === 'encrypt' && (
               <motion.div
                 initial={{ opacity: 0 }}
@@ -678,10 +750,16 @@ export default function App() {
               </motion.div>
             )}
 
-            {/* Execute Button */}
+            {/* Botón de Ejecución Maestro */}
             <div className="pt-2">
               <button
-                disabled={processState.status === 'processing'}
+                disabled={
+                  processState.status === 'processing' ||
+                  (!inputPath) ||
+                  (mode !== 'stego' && cryptoMethod === 'password' && !password) ||
+                  (mode !== 'stego' && cryptoMethod === 'quantum' && !quantumKey) ||
+                  (mode === 'stego' && stegoAction === 'hide' && !carrierPath)
+                }
                 onClick={runOperation}
                 className={cn(
                   "w-full h-16 rounded-2xl font-bold text-lg flex items-center justify-center gap-3 transition-all relative overflow-hidden group",
@@ -694,9 +772,20 @@ export default function App() {
                 )}
               >
                 {processState.status === 'processing' ? (
-                  <div className="flex items-center gap-3">
-                    <Activity className="w-5 h-5 animate-pulse" />
-                    <span>PROCESANDO...</span>
+                  <div className="flex flex-col items-center gap-1 w-full px-6">
+                    <div className="flex items-center gap-3">
+                      <Activity className="w-5 h-5 animate-spin" />
+                      <span className="tracking-[0.2em]">PROCESANDO...</span>
+                    </div>
+                    {/* Progress Bar Indeterminada */}
+                    <div className="w-full h-1 bg-black/40 rounded-full overflow-hidden relative mt-1">
+                      <motion.div 
+                        initial={{ x: '-100%' }}
+                        animate={{ x: '100%' }}
+                        transition={{ repeat: Infinity, duration: 1.5, ease: 'linear' }}
+                        className="w-1/2 h-full bg-white/80 rounded-full"
+                      />
+                    </div>
                   </div>
                 ) : (
                   <>
@@ -717,7 +806,7 @@ export default function App() {
               </button>
             </div>
 
-            {/* Status Feedback */}
+            {/* Panel de Feedback de Estado (Éxito/Error) */}
             <AnimatePresence>
               {processState.status !== 'idle' && processState.status !== 'processing' && (
                 <motion.div
@@ -742,7 +831,7 @@ export default function App() {
             </AnimatePresence>
           </div>
 
-          {/* Footer Info Bars */}
+          {/* Barras de Información del Pie (Métodos Activos) */}
           <div className="flex border-t border-white/5 divide-x divide-white/5 bg-white/[0.02]">
             <div className="flex-1 p-4 flex flex-col items-center">
               <span className="text-[9px] text-white/30 uppercase font-bold tracking-tighter">Cifrado</span>
@@ -750,7 +839,7 @@ export default function App() {
             </div>
             <div
               className="flex-1 p-4 flex flex-col items-center group cursor-pointer hover:bg-white/5 transition-colors border-l border-white/5"
-              onClick={() => identity ? setShowIdentityModal(true) : handleGenerateIdentity()}
+              onClick={() => { setAuthTarget('keys'); setAuthInput(""); }}
             >
               <span className="text-[9px] text-white/30 uppercase font-bold tracking-tighter">Identidad PQC</span>
               <span className={cn(
@@ -778,459 +867,55 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Identity Modal */}
-        <AnimatePresence>
-          {showIdentityModal && identity && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/60 backdrop-blur-md">
-              <motion.div
-                initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="w-full max-w-xl bg-zinc-900 border border-white/10 rounded-[32px] overflow-hidden shadow-2xl"
-              >
-                <div className="p-8 space-y-6 max-h-[90vh] overflow-y-auto custom-scrollbar">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                        <Fingerprint className="text-brand-cyan w-5 h-5" /> Tu Identidad Cuántica
-                      </h2>
-                      <p className="text-xs text-white/40 mt-1">Híbrida: ML-KEM-1024 + ML-DSA-65</p>
-                    </div>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => setShowKeyGuide(!showKeyGuide)}
-                        className={cn(
-                          "w-8 h-8 rounded-full flex items-center justify-center transition-all",
-                          showKeyGuide ? "bg-brand-cyan text-black" : "bg-white/5 text-white/40 hover:bg-white/10"
-                        )}
-                        title="¿Cómo usar estas llaves?"
-                      >
-                        <Info className="w-4 h-4" />
-                      </button>
-                      <button onClick={() => setShowIdentityModal(false)} className="text-white/20 hover:text-white/60 transition-colors">
-                        <XCircle className="w-6 h-6" />
-                      </button>
-                    </div>
-                  </div>
+        <IdentityModal
+          show={showIdentityModal}
+          identity={identity}
+          showKeyGuide={showKeyGuide}
+          onClose={() => setShowIdentityModal(false)}
+          onToggleGuide={() => setShowKeyGuide(v => !v)}
+          onCopyKey={copyToClipboard}
+          onRegenerate={handleGenerateIdentity}
+          onDelete={() => { setIdentity(null); setShowIdentityModal(false); }}
+        />
 
-                  <AnimatePresence>
-                    {showKeyGuide && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: 'auto', opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        className="overflow-hidden"
-                      >
-                        <div className="bg-brand-cyan/5 border border-brand-cyan/20 rounded-2xl p-5 space-y-4 text-[10px] leading-relaxed text-white/70">
-                          <p className="font-bold text-brand-cyan uppercase tracking-widest text-[9px]">Protocolo de Uso de Llaves:</p>
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div className="space-y-1">
-                              <p className="text-white font-bold">1. Pública (Cifrado):</p>
-                              <p>Dásela a tus contactos. Ellos la usarán para enviarte archivos que solo TÚ podrás abrir.</p>
-                            </div>
-                            <div className="space-y-1">
-                              <p className="text-white font-bold">2. Privada (Cifrado):</p>
-                              <p><strong>NUNCA LA COMPARTAS.</strong> Es la única llave capaz de abrir los archivos cifrados con tu llave pública.</p>
-                            </div>
-                            <div className="space-y-1">
-                              <p className="text-white font-bold">3. Pública (Verificación):</p>
-                              <p>Dásela a tus contactos. Ellos la usarán para confirmar que un archivo fue realmente firmado por ti.</p>
-                            </div>
-                            <div className="space-y-1">
-                              <p className="text-white font-bold">4. Privada (Firma):</p>
-                              <p><strong>SOLO TUYA.</strong> Se usa para poner un "sello digital" infalsificable en tus archivos antes de enviarlos.</p>
-                            </div>
-                          </div>
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
+        <ContactsModal
+          show={showContacts}
+          contacts={contacts}
+          copiedContact={copiedContact}
+          isLoading={isLoadingContacts}
+          onClose={closeContacts}
+          onAddContact={handleAddContact}
+          onDeleteContact={handleDeleteContact}
+          onCopyKey={async (text, contactId) => {
+            await copyToClipboard(text);
+            setCopiedContact(contactId);
+            setTimeout(() => setCopiedContact(null), 1500);
+          }}
+        />
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* Cifrado KEM */}
-                    <div className="space-y-4">
-                      <div className="space-y-2">
-                        <div className="flex justify-between items-center text-[10px] font-bold text-brand-cyan uppercase tracking-widest px-1">
-                          <span>Pública (Cifrado)</span>
-                          <button onClick={() => copyToClipboard(identity.kem_pub)} className="hover:text-white transition-colors">Copiar</button>
-                        </div>
-                        <div className="bg-black/40 border border-white/5 rounded-xl p-3 font-mono text-[8px] break-all leading-tight text-white/60 h-20 overflow-y-auto custom-scrollbar">
-                          {identity.kem_pub}
-                        </div>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex justify-between items-center text-[10px] font-bold text-brand-violet uppercase tracking-widest px-1">
-                          <span>Privada (Cifrado)</span>
-                          <button onClick={() => copyToClipboard(identity.kem_priv)} className="hover:text-white transition-colors">Copiar</button>
-                        </div>
-                        <div className="bg-black/40 border border-white/5 rounded-xl p-3 font-mono text-[8px] break-all leading-tight text-white/40 h-20 overflow-y-auto custom-scrollbar">
-                          {identity.kem_priv}
-                        </div>
-                      </div>
-                    </div>
+        <SecurityGuideModal show={showGuide} onClose={() => setShowGuide(false)} />
 
-                    {/* Firma DSA */}
-                    <div className="space-y-4">
-                      <div className="space-y-2">
-                        <div className="flex justify-between items-center text-[10px] font-bold text-brand-emerald uppercase tracking-widest px-1">
-                          <span>Pública (Verificación)</span>
-                          <button onClick={() => copyToClipboard(identity.dsa_pub)} className="hover:text-white transition-colors">Copiar</button>
-                        </div>
-                        <div className="bg-black/40 border border-white/5 rounded-xl p-3 font-mono text-[8px] break-all leading-tight text-white/60 h-20 overflow-y-auto custom-scrollbar">
-                          {identity.dsa_pub}
-                        </div>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex justify-between items-center text-[10px] font-bold text-brand-amber-400 uppercase tracking-widest px-1">
-                          <span>Privada (Firma)</span>
-                          <button onClick={() => copyToClipboard(identity.dsa_priv)} className="hover:text-white transition-colors">Copiar</button>
-                        </div>
-                        <div className="bg-black/40 border border-white/5 rounded-xl p-3 font-mono text-[8px] break-all leading-tight text-white/40 h-20 overflow-y-auto custom-scrollbar">
-                          {identity.dsa_priv}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
+        <ReAuthModal
+          authTarget={authTarget}
+          authInput={authInput}
+          onAuthInputChange={setAuthInput}
+          onVerify={handleReAuthVerify}
+          onCancel={() => { setAuthTarget(null); setAuthInput(""); }}
+        />
 
-                  <div className="bg-white/5 border border-white/10 p-4 rounded-2xl flex gap-3">
-                    <ShieldAlert className="w-5 h-5 text-brand-cyan flex-shrink-0" />
-                    <p className="text-[10px] text-white/60 leading-snug">
-                      <strong>FIPS-204 Standard:</strong> Esta identidad permite cifrado resistente a ordenadores cuánticos y firmas digitales infalsificables. Asegúrate de guardar las 4 llaves en un lugar seguro.
-                    </p>
-                  </div>
-
-                  <div className="pt-2 flex flex-col sm:flex-row gap-3">
-                    <button
-                      onClick={() => {
-                        if (!identity) return;
-                        const formattedKeys = `=== IDENTIDAD CUÁNTICA CRYPTOBRO ===
-Protocolo: ML-KEM-1024 + ML-DSA-65
-
-[ LLAVES DE CIFRADO (KEM) ]
-Pública (Para recibir archivos - Compartible):
-${identity.kem_pub}
-
-Privada (Para abrir archivos - NO COMPARTIR):
-${identity.kem_priv}
-
-[ LLAVES DE FIRMA (DSA) ]
-Pública (Para verificar tus archivos - Compartible):
-${identity.dsa_pub}
-
-Privada (Para firmar archivos - NO COMPARTIR):
-${identity.dsa_priv}
-====================================`;
-                        copyToClipboard(formattedKeys);
-                      }}
-                      className="flex-[2] py-3 bg-brand-cyan text-black rounded-2xl text-[10px] font-bold uppercase tracking-widest hover:bg-brand-cyan/80 transition-all shadow-lg shadow-brand-cyan/20"
-                    >
-                      Copiar Todas las Llaves (Backup)
-                    </button>
+        <GatekeeperModal
+          showInitialWarning={showInitialWarning}
+          showGatekeeper={showGatekeeper}
+          isAppUnlocked={isAppUnlocked}
+          contactsPassword={contactsPassword}
+          onContactsPasswordChange={setContactsPassword}
+          onWarningAccepted={() => { setShowInitialWarning(false); setShowGatekeeper(true); }}
+          onUnlock={handleGatekeeperUnlock}
+        />
 
 
-                    <button
-                      onClick={async () => {
-                        const ok = await ask("¿Estás seguro? Esto reemplazará tu identidad cuántica actual con una nueva.", { title: "Regenerar Identidad", kind: "warning" });
-                        if (ok) handleGenerateIdentity();
-                      }}
-                      className="flex-1 py-3 bg-white/5 border border-white/10 rounded-2xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-all text-white/60"
-                    >
-                      Regenerar Nueva Identidad
-                    </button>
-                    <button
-                      onClick={async () => {
-                        const ok = await ask("¿Eliminar la identidad cuántica de la memoria? Esta acción no se puede deshacer y no puedes recuperar las llaves si no las has guardado.", { title: "Eliminar Identidad", kind: "warning" });
-                        if (ok) {
-                          setIdentity(null);
-                          setShowIdentityModal(false);
-                        }
-                      }}
-                      className="px-6 py-3 bg-red-500/10 border border-red-500/20 rounded-2xl text-[10px] font-bold uppercase tracking-widest hover:bg-red-500/20 transition-all text-red-400"
-                    >
-                      Eliminar
-                    </button>
-                  </div>
-                </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
 
-        {/* Contacts Modal */}
-        <AnimatePresence>
-          {showContacts && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/60 backdrop-blur-md">
-              <motion.div
-                initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="w-full max-w-lg bg-zinc-900 border border-white/10 rounded-[32px] overflow-hidden shadow-2xl"
-              >
-                {!isContactsUnlocked ? (
-                  /* Password Prompt for Contacts */
-                  <div className="p-8 space-y-6">
-                    <div className="text-center space-y-2">
-                      <div className="w-16 h-16 bg-brand-cyan/20 rounded-full flex items-center justify-center mx-auto mb-4">
-                        <Lock className="text-brand-cyan w-8 h-8" />
-                      </div>
-                      <h2 className="text-xl font-bold text-white">Libreta Bloqueada</h2>
-                      <p className="text-xs text-white/40">Introduce tu contraseña maestra para acceder</p>
-                    </div>
-                    <div className="space-y-4">
-                      <input
-                        type="password"
-                        placeholder="Contraseña de la bóveda..."
-                        value={contactsPassword}
-                        onChange={e => setContactsPassword(e.target.value)}
-                        onKeyDown={e => e.key === 'Enter' && loadContacts()}
-                        className="w-full bg-black/40 border border-white/10 rounded-2xl px-6 py-4 text-center focus:outline-none focus:ring-2 focus:ring-brand-cyan/20"
-                      />
-                      <div className="flex gap-3">
-                        <button
-                          onClick={closeContacts}
-                          className="flex-1 py-3 bg-white/5 rounded-2xl text-[10px] font-bold uppercase tracking-widest text-white/40"
-                        >
-                          Cancelar
-                        </button>
-                        <button
-                          onClick={() => loadContacts()}
-                          className="flex-1 py-3 bg-brand-cyan text-black rounded-2xl text-[10px] font-bold uppercase tracking-widest"
-                        >
-                          Desbloquear
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  /* Contacts Content (Unlocked) */
-                  <div className="p-8 space-y-6">
-                    <div className="flex justify-between items-start">
-                      <div>
-                        <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                          <Users className="text-brand-cyan w-5 h-5" /> Libreta de Contactos
-                        </h2>
-                        <p className="text-xs text-white/40 mt-1">Llaves Públicas Guardadas (Cifrado AES-256)</p>
-                      </div>
-                      <button onClick={closeContacts} className="text-white/20 hover:text-white/60 transition-colors">
-                        <XCircle className="w-6 h-6" />
-                      </button>
-                    </div>
-
-                    {/* Add Contact Form */}
-                    <div className="bg-white/5 border border-white/5 p-4 rounded-2xl space-y-3">
-                      <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest px-1">Añadir Nuevo</p>
-                      <input
-                        type="text"
-                        placeholder="Nombre del contacto..."
-                        value={newContact.name}
-                        onChange={e => setNewContact({ ...newContact, name: e.target.value })}
-                        className="w-full bg-black/40 border border-white/5 rounded-xl px-4 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-brand-cyan/40"
-                      />
-                      <textarea
-                        placeholder="Llave pública hexadecimal..."
-                        value={newContact.key}
-                        onChange={e => setNewContact({ ...newContact, key: e.target.value })}
-                        className="w-full h-20 bg-black/40 border border-white/5 rounded-xl px-4 py-2 text-[9px] font-mono focus:outline-none focus:ring-1 focus:ring-brand-cyan/40 resize-none"
-                      />
-                      <button
-                        onClick={handleAddContact}
-                        className="w-full py-2 bg-brand-cyan text-black font-bold text-[10px] rounded-xl hover:bg-white transition-colors uppercase tracking-widest"
-                      >
-                        Guardar Contacto
-                      </button>
-                    </div>
-
-                    {/* Contacts List */}
-                    <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-2">
-                      {contacts.length === 0 && (
-                        <p className="text-center text-xs text-white/20 py-4 italic">No hay contactos guardados</p>
-                      )}
-                      {contacts.map(c => (
-                        <div
-                          key={c.name}
-                          onClick={async () => {
-                            await copyToClipboard(c.public_key);
-                            setCopiedContact(c.name);
-                            setTimeout(() => setCopiedContact(null), 1500);
-                          }}
-                          className="flex items-center justify-between p-3 bg-white/[0.02] border border-white/5 rounded-xl group hover:bg-white/5 hover:border-brand-cyan/20 transition-all cursor-pointer"
-                          title="Clic para copiar llave pública"
-                        >
-                          <div className="flex-1 min-w-0 pr-4">
-                            <div className="flex items-center gap-2">
-                              <p className="text-xs font-bold text-white/80">{c.name}</p>
-                              {copiedContact === c.name && (
-                                <span className="text-[9px] text-brand-emerald font-bold uppercase tracking-widest">✓ Copiada</span>
-                              )}
-                            </div>
-                            <p className="text-[9px] text-white/20 font-mono truncate">{c.public_key}</p>
-                          </div>
-                          <button
-                            onClick={e => { e.stopPropagation(); handleDeleteContact(c.name); }}
-                            className="text-white/10 hover:text-red-400 transition-colors flex-shrink-0"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
-
-        {/* Security Guide Modal */}
-        <AnimatePresence>
-          {showGuide && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/80 backdrop-blur-xl">
-              <motion.div
-                initial={{ opacity: 0, scale: 0.9, y: 20 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                className="w-full max-w-2xl bg-zinc-900 border border-white/10 rounded-[40px] overflow-hidden shadow-2xl"
-              >
-                <div className="p-10 space-y-8 max-h-[85vh] overflow-y-auto custom-scrollbar">
-                  <div className="flex justify-between items-start">
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 bg-brand-cyan/20 rounded-2xl flex items-center justify-center">
-                        <HelpCircle className="text-brand-cyan w-6 h-6" />
-                      </div>
-                      <div>
-                        <h2 className="text-2xl font-bold text-white">Guía de Seguridad</h2>
-                        <p className="text-xs text-white/40 uppercase tracking-widest mt-1">Cómo funciona CryptoBro</p>
-                      </div>
-                    </div>
-                    <button onClick={() => setShowGuide(false)} className="text-white/20 hover:text-white/60 transition-colors">
-                      <XCircle className="w-8 h-8" />
-                    </button>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    {/* Sección 1: Cifrado en Cascada */}
-                    <div className="bg-white/[0.02] border border-white/5 p-6 rounded-[24px] space-y-3">
-                      <div className="flex items-center gap-2 text-brand-cyan">
-                        <Layers className="w-4 h-4" />
-                        <h3 className="text-xs font-bold uppercase tracking-widest">Cifrado Simétrico</h3>
-                      </div>
-                      <p className="text-[11px] text-white/60 leading-relaxed">
-                        Usamos un sistema de <strong>doble capa</strong>: AES-256-GCM y ChaCha20-Poly1305. Cada bloque se cifra dos veces con diferentes algoritmos para garantizar que, si uno falla, el otro proteja tus datos.
-                      </p>
-                    </div>
-
-                    {/* Sección 2: Quantum Ready */}
-                    <div className="bg-white/[0.02] border border-white/5 p-6 rounded-[24px] space-y-3">
-                      <div className="flex items-center gap-2 text-brand-violet">
-                        <Cpu className="w-4 h-4" />
-                        <h3 className="text-xs font-bold uppercase tracking-widest">Post-Quantum</h3>
-                      </div>
-                      <p className="text-[11px] text-white/60 leading-relaxed">
-                        Implementamos <strong>ML-KEM-1024</strong> (Kyber), el estándar de NIST contra ataques de ordenadores cuánticos. Las llaves tradicionales (RSA/ECC) serán vulnerables pronto; CryptoBro ya está protegido.
-                      </p>
-                    </div>
-
-                    {/* Sección 3: Firmas Digitales */}
-                    <div className="bg-white/[0.02] border border-white/5 p-6 rounded-[24px] space-y-3">
-                      <div className="flex items-center gap-2 text-brand-emerald">
-                        <FileCode2 className="w-4 h-4" />
-                        <h3 className="text-xs font-bold uppercase tracking-widest">Firmas ML-DSA</h3>
-                      </div>
-                      <p className="text-[11px] text-white/60 leading-relaxed">
-                        Cada archivo puede ser firmado con <strong>ML-DSA-65</strong> (Dilithium). Esto permite al receptor verificar que el archivo es auténtico y no ha sido modificado por terceros (Anti-Tampering).
-                      </p>
-                    </div>
-
-                    {/* Sección 4: Esteganografía */}
-                    <div className="bg-white/[0.02] border border-white/5 p-6 rounded-[24px] space-y-3">
-                      <div className="flex items-center gap-2 text-brand-amber-400">
-                        <Globe className="w-4 h-4" />
-                        <h3 className="text-xs font-bold uppercase tracking-widest">Camuflaje</h3>
-                      </div>
-                      <p className="text-[11px] text-white/60 leading-relaxed">
-                        El modo "Ocultar" permite inyectar tus contenedores <code>.vault</code> dentro de imágenes JPG o PNG. La imagen seguirá pareciendo normal, pero contendrá tus secretos ocultos al final del archivo.
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Sección Extra: Borrado Seguro */}
-                  <div className="bg-red-500/5 border border-red-500/10 p-6 rounded-[24px] flex gap-4 items-center">
-                    <Trash2 className="w-10 h-10 text-red-500/40" />
-                    <div>
-                      <h3 className="text-[10px] font-bold text-red-400 uppercase tracking-widest mb-1">Borrado Seguro (Shredding)</h3>
-                      <p className="text-[11px] text-white/50 leading-snug">
-                        Al habilitar esta opción, el archivo original se sobrescribe con <strong>3 pasadas</strong> (basado en el estándar <strong>DoD 5220.22-M</strong>: Ceros, Unos y Ruido aleatorio criptográfico) antes de ser eliminado, haciendo imposible su recuperación forense.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="text-center pt-4">
-                    <p className="text-[9px] text-white/20 uppercase tracking-[0.3em]">CryptoBro Security Framework v2.1 • 2026</p>
-                  </div>
-                </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
-
-        {/* Initial Security Warning Modal */}
-        <AnimatePresence>
-          {showInitialWarning && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="absolute inset-0 bg-black/80 backdrop-blur-md"
-              />
-              <motion.div
-                initial={{ opacity: 0, scale: 0.95, y: 20 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.95, y: -20 }}
-                className="relative w-full max-w-md bg-black border border-brand-amber-400/30 rounded-[32px] p-8 shadow-2xl overflow-hidden"
-              >
-                {/* Background glow */}
-                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-32 h-32 bg-brand-amber-400/20 rounded-full blur-[50px] pointer-events-none" />
-
-                <div className="relative flex flex-col items-center text-center">
-                  <div className="w-16 h-16 rounded-2xl bg-brand-amber-400/10 flex items-center justify-center border border-brand-amber-400/20 mb-6 text-brand-amber-400 shadow-inner">
-                    <AlertTriangle className="w-8 h-8" />
-                  </div>
-
-                  <h2 className="text-xl font-bold mb-2">Aviso de Seguridad Crítico</h2>
-                  <p className="text-[10px] text-brand-amber-400 font-bold uppercase tracking-widest mb-6">Zero-Knowledge Architecture</p>
-
-                  <div className="bg-white/[0.02] border border-white/5 p-5 rounded-2xl mb-8 space-y-4 text-left">
-                    <p className="text-sm text-white/80 leading-relaxed">
-                      CryptoBro opera en un entorno de <strong className="text-white">memoria volátil</strong> para garantizar máxima seguridad.
-                    </p>
-                    <div className="flex gap-3 items-start">
-                      <div className="w-1.5 h-1.5 rounded-full bg-red-400 mt-1.5 shrink-0" />
-                      <p className="text-xs text-white/60 leading-relaxed">
-                        <strong className="text-red-400">Si cierras la aplicación o regeneras la identidad</strong>, TODAS las claves activas (incluyendo contraseñas maestras y llaves cuánticas en uso) se destruirán irremediablemente.
-                      </p>
-                    </div>
-                    <div className="flex gap-3 items-start">
-                      <div className="w-1.5 h-1.5 rounded-full bg-brand-emerald mt-1.5 shrink-0" />
-                      <p className="text-xs text-white/60 leading-relaxed">
-                        Asegúrate de copiar y guardar tus llaves cuánticas generadas antes de salir. No hay forma de recuperarlas una vez cerrada la sesión y, sin ellas, te será imposible descifrar los archivos cifrados en la sesión en el futuro.
-                      </p>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={() => setShowInitialWarning(false)}
-                    className="w-full py-4 bg-brand-amber-400/10 hover:bg-brand-amber-400 text-brand-amber-400 hover:text-black font-bold uppercase tracking-widest text-xs rounded-xl transition-all duration-300 border border-brand-amber-400/30 hover:border-transparent"
-                  >
-                    Entendido, asumo el riesgo
-                  </button>
-                </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
-
-        {/* Subtle Bottom Credits */}
+        {/* Créditos Sutiles */}
         <p className="text-center mt-6 text-[10px] text-white/10 uppercase font-bold tracking-[0.4em]">
           © Daniel Q. Parra
         </p>

@@ -60,6 +60,8 @@ fn check_and_register_attempt(key: &str, success: bool) -> Result<(), String> {
 pub struct Contact {
     pub name: String,
     pub public_key: String,
+    #[serde(default)]
+    pub verifier_key: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,16 +71,16 @@ struct EncryptedStore {
     pub data: String,
 }
 
-fn get_contacts_path(app: &AppHandle) -> PathBuf {
+fn get_contacts_path(app: &AppHandle) -> Result<PathBuf, String> {
     let mut path = app
         .path()
         .app_config_dir()
-        .expect("No se pudo encontrar el directorio de configuración");
+        .map_err(|_| "No se pudo encontrar el directorio de configuración del sistema")?;
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
     path.push("contacts.vault");
-    path
+    Ok(path)
 }
 
 /// Deriva la clave AES-256 para el vault de contactos usando Argon2id.
@@ -94,7 +96,7 @@ fn derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
 
 #[tauri::command]
 pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Contact>, String> {
-    let path = get_contacts_path(&app);
+    let path = get_contacts_path(&app)?;
     if !path.exists() {
         return Ok(vec![]);
     }
@@ -176,8 +178,9 @@ pub fn save_contact(
     mut password: String,
     name: String,
     public_key: String,
+    verifier_key: String,
 ) -> Result<(), String> {
-    let path = get_contacts_path(&app);
+    let path = get_contacts_path(&app)?;
 
     let mut contacts = if path.exists() {
         get_contacts(app.clone(), Some(password.clone()))?
@@ -186,7 +189,7 @@ pub fn save_contact(
     };
 
     contacts.retain(|c| c.name != name);
-    contacts.push(Contact { name, public_key });
+    contacts.push(Contact { name, public_key, verifier_key });
 
     let result = encrypt_and_save(path, &password, &contacts);
     password.zeroize(); // Defensa RAM: Destruir contraseña de la libreta
@@ -195,7 +198,7 @@ pub fn save_contact(
 
 #[tauri::command]
 pub fn delete_contact(app: AppHandle, mut password: String, name: String) -> Result<(), String> {
-    let path = get_contacts_path(&app);
+    let path = get_contacts_path(&app)?;
     let mut contacts = get_contacts(app.clone(), Some(password.clone()))?;
     contacts.retain(|c| c.name != name);
     let result = encrypt_and_save(path, &password, &contacts);

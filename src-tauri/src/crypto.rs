@@ -25,11 +25,21 @@ pub struct EncryptResponse {
     pub data: Option<String>,
 }
 
-// Constantes de seguridad
-/// --- CONSTANTES Y CONFIGURACIÓN ---
+// --- CONSTANTES Y CONFIGURACIÓN ---
 const SALT_SIZE: usize = 16;
 const NONCE_SIZE: usize = 12; // Estándar para GCM y Poly1305
 const CHUNK_SIZE: usize = 64 * 1024; // 64KB por bloque para optimizar RAM (Streaming)
+
+// Constantes Criptográficas PQC
+const ML_DSA_65_SIG_SIZE: usize = 3309;
+const ML_KEM_1024_CT_SIZE: usize = 1568;
+const ML_DSA_65_VK_SIZE: usize = 1952;
+const ML_DSA_65_SK_SIZE: usize = 4032;
+
+// Offsets estructurales de archivo
+const MAGIC_OFFSET: u64 = 5; // 4 (Magic) + 1 (ID)
+const PAYLOAD_OFFSET_WITH_MAGIC: u64 = MAGIC_OFFSET + ML_DSA_65_SIG_SIZE as u64; // 3314
+const PAYLOAD_OFFSET_LEGACY: u64 = 1 + ML_DSA_65_SIG_SIZE as u64; // 3310
 
 // Marcador único para identificar dónde empiezan los datos ocultos en esteganografía.
 // Permite buscar el inicio del vault dentro de archivos multimedia (mkv, mp3, pdf).
@@ -60,18 +70,36 @@ fn secure_shred(path: &str) -> std::io::Result<()> {
     // Pasada 2: Unos
     write_pass(&[0xFF; 65536])?;
 
-    // Pasada 3: Ruido Aleatorio
+    // Pasada 3: Ruido Aleatorio (CSPRNG via ChaCha20)
+    // Se genera una clave maestra de 32 bytes del Kernel una sola vez.
+    // Esto evita ahogar el pool de entropía del Sistema Operativo con miles de syscalls.
     file.seek(SeekFrom::Start(0))?;
-    let mut random_data = vec![0u8; 65536];
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "Error inicializando CSPRNG")
+    })?;
+
+    let zeros = vec![0u8; 65536];
     let mut written = 0;
+    let mut block_index = 0u64;
+
     while written < size {
-        OsRng.fill_bytes(&mut random_data);
-        let to_write = std::cmp::min(random_data.len() as u64, size - written) as usize;
-        file.write_all(&random_data[..to_write])?;
+        let mut nonce_bytes = [0u8; 12];
+        let idx_bytes = block_index.to_be_bytes();
+        nonce_bytes[4..12].copy_from_slice(&idx_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // ChaCha20 cifra los ceros generando 64KB de Ruido Blanco criptográfico perfecto
+        let noise = cipher.encrypt(nonce, zeros.as_slice()).unwrap_or_else(|_| zeros.clone());
+
+        let to_write = std::cmp::min(65536, size - written) as usize;
+        file.write_all(&noise[..to_write])?;
         written += to_write as u64;
+        block_index += 1;
     }
     file.sync_all()?;
-    random_data.zeroize();
+    key.zeroize();
 
     file.set_len(0)?;
     file.sync_all()?;
@@ -138,6 +166,259 @@ pub fn derive_keys(password: &str, salt: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Z
     ))
 }
 
+/// Wrapper de Write que alimenta un Sha256 mientras escribe datos en el writer subyacente.
+/// Permite calcular el hash del payload cifrado al vuelo, sin segunda lectura del archivo.
+/// Esto es la pieza clave para la atomicidad de la firma (Bug #2 Fix).
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: sha2::Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+
+    /// Consume el wrapper y devuelve el inner junto con el hash calculado.
+    fn finalize(self) -> (W, sha2::digest::Output<sha2::Sha256>) {
+        (self.inner, sha2::Digest::finalize(self.hasher))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        sha2::Digest::update(&mut self.hasher, &buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Wrapper que implementa std::io::Write para cifrar datos al vuelo (Streaming Encryptor).
+/// Acumula bytes hasta alcanzar CHUNK_SIZE y los cifra automáticamente antes de escribirlos al disco.
+pub struct EncryptWriter<W: Write> {
+    inner: W,
+    buffer: Vec<u8>,
+    aes_cipher: Aes256Gcm,
+    chacha_cipher: ChaCha20Poly1305,
+    aes_nonce_raw: [u8; 12],
+    chacha_nonce_raw: [u8; 12],
+    block_index: u64,
+    error: Option<io::Error>,
+}
+
+impl<W: Write> EncryptWriter<W> {
+    pub fn new(
+        inner: W,
+        aes_cipher: Aes256Gcm,
+        chacha_cipher: ChaCha20Poly1305,
+        aes_nonce_raw: [u8; 12],
+        chacha_nonce_raw: [u8; 12],
+    ) -> Self {
+        Self {
+            inner,
+            buffer: Vec::with_capacity(CHUNK_SIZE * 2),
+            aes_cipher,
+            chacha_cipher,
+            aes_nonce_raw,
+            chacha_nonce_raw,
+            block_index: 0,
+            error: None,
+        }
+    }
+
+    /// Cifra y escribe bloques completos de 64KB, o el resto si es el bloque final.
+    fn flush_chunk(&mut self, is_final: bool) -> io::Result<()> {
+        if self.error.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Other, "EncryptWriter está en estado de error"));
+        }
+
+        while self.buffer.len() >= CHUNK_SIZE || (is_final && !self.buffer.is_empty()) {
+            let chunk_len = std::cmp::min(self.buffer.len(), CHUNK_SIZE);
+            let chunk = &self.buffer[..chunk_len];
+
+            let aes_nonce = derive_block_nonce(&self.aes_nonce_raw, self.block_index);
+            let chacha_nonce = derive_block_nonce(&self.chacha_nonce_raw, self.block_index);
+
+            // Capa 1: AES
+            let enc_aes = match self.aes_cipher.encrypt(Nonce::from_slice(&aes_nonce), chunk) {
+                Ok(enc) => enc,
+                Err(_) => {
+                    self.error = Some(io::Error::new(io::ErrorKind::InvalidData, "Fallo al cifrar (AES)"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Fallo al cifrar (AES)"));
+                }
+            };
+            // Capa 2: ChaCha20
+            let enc_final = match self.chacha_cipher.encrypt(Nonce::from_slice(&chacha_nonce), enc_aes.as_slice()) {
+                Ok(enc) => enc,
+                Err(_) => {
+                    self.error = Some(io::Error::new(io::ErrorKind::InvalidData, "Fallo al cifrar (ChaCha)"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Fallo al cifrar (ChaCha)"));
+                }
+            };
+
+            let len = enc_final.len() as u32;
+            if let Err(e) = self.inner.write_all(&len.to_be_bytes()) {
+                self.error = Some(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                return Err(e);
+            }
+            if let Err(e) = self.inner.write_all(&enc_final) {
+                self.error = Some(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                return Err(e);
+            }
+
+            self.block_index += 1;
+            
+            // Eliminar el trozo procesado de forma eficiente
+            self.buffer.drain(..chunk_len);
+        }
+
+        if is_final {
+            if let Err(e) = self.inner.flush() {
+                self.error = Some(io::Error::new(io::ErrorKind::Other, e.to_string()));
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finaliza el cifrado, procesa cualquier dato restante y extrae el writer interno.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.flush_chunk(true)?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for EncryptWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.error.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Other, "EncryptWriter está en estado de error"));
+        }
+        self.buffer.extend_from_slice(buf);
+        self.flush_chunk(false)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // No forzamos flush de bloques parciales para no corromper el alineamiento de 64KB.
+        // El verdadero flush del bloque parcial ocurrirá en .finish()
+        Ok(())
+    }
+}
+
+/// Wrapper que implementa std::io::Read para descifrar datos al vuelo (Streaming Decryptor).
+pub struct DecryptReader<R: Read> {
+    inner: R,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+    aes_cipher: Aes256Gcm,
+    chacha_cipher: ChaCha20Poly1305,
+    aes_nonce_raw: [u8; 12],
+    chacha_nonce_raw: [u8; 12],
+    block_index: u64,
+    use_compression: bool,
+    is_eof: bool,
+}
+
+impl<R: Read> DecryptReader<R> {
+    pub fn new(
+        inner: R,
+        aes_cipher: Aes256Gcm,
+        chacha_cipher: ChaCha20Poly1305,
+        aes_nonce_raw: [u8; 12],
+        chacha_nonce_raw: [u8; 12],
+        use_compression: bool,
+    ) -> Self {
+        Self {
+            inner,
+            buffer: Vec::with_capacity(CHUNK_SIZE * 2),
+            buffer_pos: 0,
+            aes_cipher,
+            chacha_cipher,
+            aes_nonce_raw,
+            chacha_nonce_raw,
+            block_index: 0,
+            use_compression,
+            is_eof: false,
+        }
+    }
+
+    fn fetch_next_chunk(&mut self) -> io::Result<bool> {
+        if self.is_eof {
+            return Ok(false);
+        }
+
+        let mut len_buf = [0u8; 4];
+        match self.inner.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.is_eof = true;
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+
+        let chunk_len = u32::from_be_bytes(len_buf) as usize;
+        if chunk_len > 1024 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bloque excesivamente grande (DoS mitigation)"));
+        }
+
+        let mut enc_chunk = vec![0u8; chunk_len];
+        self.inner.read_exact(&mut enc_chunk)?;
+
+        let aes_nonce = derive_block_nonce(&self.aes_nonce_raw, self.block_index);
+        let chacha_nonce = derive_block_nonce(&self.chacha_nonce_raw, self.block_index);
+
+        let dec_chacha = match self.chacha_cipher.decrypt(Nonce::from_slice(&chacha_nonce), enc_chunk.as_slice()) {
+            Ok(dec) => dec,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "Fallo al descifrar (ChaCha)")),
+        };
+        let dec_aes = match self.aes_cipher.decrypt(Nonce::from_slice(&aes_nonce), dec_chacha.as_slice()) {
+            Ok(dec) => dec,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "Fallo al descifrar (AES)")),
+        };
+
+        let final_data = if self.use_compression {
+            let mut decoder = GzDecoder::new(dec_aes.as_slice());
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            decompressed
+        } else {
+            dec_aes
+        };
+
+        self.buffer = final_data;
+        self.buffer_pos = 0;
+        self.block_index += 1;
+        Ok(true)
+    }
+}
+
+impl<R: Read> Read for DecryptReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.buffer_pos >= self.buffer.len() {
+            let has_more = self.fetch_next_chunk()?;
+            if !has_more {
+                return Ok(0); // EOF
+            }
+        }
+
+        let available = self.buffer.len() - self.buffer_pos;
+        let to_copy = std::cmp::min(buf.len(), available);
+        buf[..to_copy].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
+        self.buffer_pos += to_copy;
+
+        Ok(to_copy)
+    }
+}
+
+
 /// Cifra un stream de datos en bloques con doble capa (AES-256-GCM + ChaCha20-Poly1305).
 /// Función reutilizable por encrypt_file y encrypt_with_quantum para evitar duplicación.
 fn encrypt_blocks(
@@ -148,39 +429,22 @@ fn encrypt_blocks(
     aes_nonce_raw: &[u8; 12],
     chacha_nonce_raw: &[u8; 12],
 ) -> Result<(), String> {
+    let mut enc_writer = EncryptWriter::new(
+        writer,
+        aes_cipher.clone(),
+        chacha_cipher.clone(),
+        *aes_nonce_raw,
+        *chacha_nonce_raw,
+    );
     let mut buffer = vec![0u8; CHUNK_SIZE];
-    let mut block_index: u64 = 0;
     loop {
         let count = reader.read(&mut buffer).map_err(|_| "Fallo al leer datos del archivo origen")?;
         if count == 0 {
             break;
         }
-        let chunk = &buffer[..count];
-
-        // Defensa CRIME/BREACH: Se ha deshabilitado la compresión Gzip intencionadamente.
-        // Comprimir datos antes de cifrarlos es un vector de ataque conocido (Oráculo de Compresión).
-        // Al enviar el bloque en RAW (crudo), garantizamos inmunidad y multiplicamos la velocidad x100.
-
-        // Nonce único por bloque
-        let aes_nonce = derive_block_nonce(aes_nonce_raw, block_index);
-        let chacha_nonce = derive_block_nonce(chacha_nonce_raw, block_index);
-
-        // Doble capa de cifrado
-        let enc_aes = aes_cipher
-            .encrypt(Nonce::from_slice(&aes_nonce), chunk)
-            .map_err(|_| "Fallo al cifrar datos (AES)")?;
-        let enc_final = chacha_cipher
-            .encrypt(Nonce::from_slice(&chacha_nonce), enc_aes.as_slice())
-            .map_err(|_| "Fallo al cifrar datos (ChaCha20)")?;
-
-        // Escribir: longitud (4 bytes) + datos cifrados
-        let len = enc_final.len() as u32;
-        writer
-            .write_all(&len.to_be_bytes())
-            .map_err(|_| "Fallo al escribir cabecera de bloque")?;
-        writer.write_all(&enc_final).map_err(|_| "Fallo al escribir datos cifrados")?;
-        block_index += 1;
+        enc_writer.write_all(&buffer[..count]).map_err(|e| e.to_string())?;
     }
+    enc_writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -195,52 +459,21 @@ fn decrypt_blocks(
     chacha_nonce_raw: &[u8; 12],
     use_compression: bool,
 ) -> Result<(), String> {
-    let mut len_buf = [0u8; 4];
-    let mut block_index: u64 = 0;
+    let mut dec_reader = DecryptReader::new(
+        reader,
+        aes_cipher.clone(),
+        chacha_cipher.clone(),
+        *aes_nonce_raw,
+        *chacha_nonce_raw,
+        use_compression,
+    );
+    let mut buffer = vec![0u8; CHUNK_SIZE];
     loop {
-        match reader.read_exact(&mut len_buf) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(_) => return Err("Fallo de I/O al leer el contenedor seguro".into()),
+        let count = dec_reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
         }
-        let chunk_len = u32::from_be_bytes(len_buf) as usize;
-        
-        // Prevención de DoS (Memory Exhaustion)
-        // El tamaño de bloque estándar es ~65KB. Límite máximo estricto: 1 MB.
-        if chunk_len > 1024 * 1024 {
-            return Err("Bloque de datos anormalmente grande. Posible archivo corrupto o ataque DoS.".into());
-        }
-
-        let mut chunk = vec![0u8; chunk_len];
-        reader
-            .read_exact(&mut chunk)
-            .map_err(|_| "Contenedor corrupto: bloque de datos incompleto")?;
-
-        let aes_nonce = derive_block_nonce(aes_nonce_raw, block_index);
-        let chacha_nonce = derive_block_nonce(chacha_nonce_raw, block_index);
-
-        // Revertir capas
-        let dec_chacha = chacha_cipher
-            .decrypt(Nonce::from_slice(&chacha_nonce), chunk.as_slice())
-            .map_err(|_| "Fallo en Capa 2 (ChaCha20): datos corruptos o clave incorrecta")?;
-        let dec_aes = aes_cipher
-            .decrypt(Nonce::from_slice(&aes_nonce), dec_chacha.as_slice())
-            .map_err(|_| "Fallo en Capa 1 (AES-GCM): datos corruptos o clave incorrecta")?;
-
-        // Descomprimir si aplica
-        let final_data = if use_compression {
-            let mut decoder = GzDecoder::new(dec_aes.as_slice());
-            let mut decompressed = Vec::new();
-            decoder
-                .read_to_end(&mut decompressed)
-                .map_err(|_| "Fallo al descomprimir los datos")?;
-            decompressed
-        } else {
-            dec_aes
-        };
-
-        writer.write_all(&final_data).map_err(|_| "Fallo al escribir datos descifrados")?;
-        block_index += 1;
+        writer.write_all(&buffer[..count]).map_err(|_| "Fallo al escribir datos descifrados")?;
     }
     Ok(())
 }
@@ -306,8 +539,10 @@ pub async fn encrypt_file(
             &chacha_cipher,
             &aes_nonce_raw,
             &chacha_nonce_raw,
-        )
-    }).await.map_err(|_| "Error de hardware aislando el cifrado")??;
+        )?;
+        output_file.flush().map_err(|_| "Error de I/O al vaciar los datos cifrados al disco".to_string())?;
+        Ok::<(), String>(())
+    }).await.map_err(|_| "Error de hardware aislando el cifrado".to_string())??;
 
     if shred_original {
         let _ = secure_shred(&input_path);
@@ -390,7 +625,9 @@ pub async fn decrypt_file(
             &aes_nonce_raw,
             &chacha_nonce_raw,
             use_compression,
-        )
+        )?;
+        output_file.flush().map_err(|_| "Error de I/O al vaciar los datos descifrados al disco".to_string())?;
+        Ok::<(), String>(())
     }).await.map_err(|_| "Error de hardware aislando el descifrado".to_string())?.map_err(|e| {
         // Prevención de Unauthenticated Plaintext Release: Destruir archivo parcial en caso de error
         let _ = secure_shred(&output_path_clone);
@@ -439,13 +676,13 @@ pub async fn generate_quantum_keys() -> Result<EncryptResponse, String> {
 }
 
 /// Comando para cifrar con identidad cuántica
-#[tauri::command]
-pub async fn encrypt_with_quantum(
+async fn encrypt_quantum_internal(
     input_path: String,
     output_path: String,
     mut public_key_hex: String,
     signing_key_hex: Option<String>,
     shred_original: bool,
+    is_folder: bool,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
     validate_path(&output_path)?;
@@ -460,7 +697,7 @@ pub async fn encrypt_with_quantum(
     public_key_hex.zeroize(); // Defensa RAM: Destruir llave cuántica
 
     // Parsear la llave pública
-    let pk_bytes_array: &[u8; 1568] = pk_bytes
+    let pk_bytes_array: &[u8; ML_KEM_1024_CT_SIZE] = pk_bytes
         .as_slice()
         .try_into()
         .map_err(|_| "Longitud de llave pública incorrecta")?;
@@ -478,7 +715,6 @@ pub async fn encrypt_with_quantum(
     // Pero primero, necesitamos escribir el Ciphertext de ML-KEM en el archivo de salida
     // para que el destinatario pueda decapsularlo.
 
-    let mut input_file = File::open(&input_path).map_err(|_| "Error al leer archivo origen.")?;
     let mut output_file =
         File::create(&output_path).map_err(|_| "Error al crear archivo destino.")?;
 
@@ -493,16 +729,16 @@ pub async fn encrypt_with_quantum(
         .write_all(&[vault_id])
         .map_err(|_| "Error de I/O")?;
 
-    // Si es firmado, reservamos espacio para la firma (3309 bytes para ML-DSA-65)
+    // Si es firmado, reservamos espacio para la firma (ML_DSA_65_SIG_SIZE bytes para ML-DSA-65)
     // Pero es mejor escribirla al final o después del ID.
     // Escribamos un marcador de posición si es ID 2.
     if vault_id == 2 {
         output_file
-            .write_all(&[0u8; 3309])
+            .write_all(&[0u8; ML_DSA_65_SIG_SIZE])
             .map_err(|_| "Error de I/O")?;
     }
 
-    // 2. Escribir el Ciphertext de ML-KEM (1568 bytes para ML-KEM-1024)
+    // 2. Escribir el Ciphertext de ML-KEM (ML_KEM_1024_CT_SIZE bytes para ML-KEM-1024)
     output_file
         .write_all(ciphertext.as_slice())
         .map_err(|_| "Error de I/O al escribir KEM ciphertext")?;
@@ -539,116 +775,179 @@ pub async fn encrypt_with_quantum(
     let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice())
         .map_err(|_| "Error al inicializar cifrador ChaCha20")?;
 
-    tokio::task::spawn_blocking(move || {
-        encrypt_blocks(
-            &mut input_file,
-            &mut output_file,
-            &aes_cipher,
-            &chacha_cipher,
-            &aes_nonce_raw,
-            &chacha_nonce_raw,
-        )?;
-        
-        // Finalizar escritura y asegurar en disco dentro del mismo hilo bloqueante
-        output_file
-            .flush()
-            .map_err(|_| "Error de I/O al vaciar buffer".to_string())?;
-        output_file
-            .sync_all()
-            .map_err(|_| "Error de I/O al sincronizar disco".to_string())?;
-            
-        Ok::<(), String>(())
-    }).await.map_err(|_| "Error de hardware aislando el cifrado cuántico".to_string())??;
 
-    // 5. Firma Digital con Hash Streaming (evita cargar el archivo completo en RAM)
-    // BUG FIX #1: Antes usábamos `if parts.len() == 2` que ignoraba silenciosamente el error
-    // si la llave tenía un formato incorrecto, produciendo un vault firmado pero sin firma real.
-    // Ahora devolvemos un error explícito si el formato de la llave combinada es inválido.
-    if let Some(mut sk_combined_hex) = signing_key_hex {
-        // Prevención de colapso de memoria (OOM)
-        if sk_combined_hex.len() > 20_000 {
-            sk_combined_hex.zeroize();
-            let _ = secure_shred(&output_path);
-            return Err("Llave de firma demasiado grande (Riesgo OOM)".into());
-        }
-
-        let parts: Vec<&str> = sk_combined_hex.split(':').collect();
-        if parts.len() != 2 {
-            sk_combined_hex.zeroize();
-            // Limpiar el archivo de salida corrupto antes de abortar
-            let _ = secure_shred(&output_path);
-            return Err(
-                "Formato de llave de firma inválido. Se esperaba 'llave_publica:llave_privada'."
-                    .into(),
-            );
-        }
-        let vk_bytes =
-            hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
-        let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
-        sk_combined_hex.zeroize(); // Defensa RAM: Destruir llave de firma
-
-        // Calcular SHA-256 del cuerpo del archivo (desde byte 3314 = Magic+ID+Firma reservada)
-        // IMPORTANTE: El hash se calcula sobre todo el contenido DESPUÉS de la firma reservada,
-        // incluyendo el KEM ciphertext, flags, salt, nonces y payload cifrado.
-        let mut hasher = Sha256::new();
-        let mut sign_file =
-            File::open(&output_path).map_err(|_| "Error al abrir archivo para firma")?;
-        sign_file
-            .seek(SeekFrom::Start(3314))
-            .map_err(|_| "Error I/O al posicionar cursor de firma")?;
-        let mut hash_buf = [0u8; 65536];
-        loop {
-            let n = sign_file
-                .read(&mut hash_buf)
-                .map_err(|_| "Error de lectura al calcular hash")?;
-            if n == 0 {
-                break;
+    // Preparar llaves de firma ANTES del spawn_blocking para detectar errores temprano
+    // (Bug #2 Fix: decodificamos las llaves antes de entrar al bloque bloqueante)
+    let signing_keys: Option<([u8; ML_DSA_65_VK_SIZE], [u8; ML_DSA_65_SK_SIZE])> =
+        if let Some(mut sk_combined_hex) = signing_key_hex {
+            if sk_combined_hex.len() > 20_000 {
+                sk_combined_hex.zeroize();
+                let _ = secure_shred(&output_path);
+                return Err("Llave de firma demasiado grande (Riesgo OOM)".into());
             }
-            hasher.update(&hash_buf[..n]);
+            let parts: Vec<&str> = sk_combined_hex.split(':').collect();
+            if parts.len() != 2 {
+                sk_combined_hex.zeroize();
+                let _ = secure_shred(&output_path);
+                return Err(
+                    "Formato de llave de firma inválido. Se esperaba 'llave_publica:llave_privada'."
+                        .into(),
+                );
+            }
+            let vk_bytes =
+                hex::decode(parts[0]).map_err(|_| "Llave de verificación de firma inválida")?;
+            let sk_bytes = hex::decode(parts[1]).map_err(|_| "Llave de firma privada inválida")?;
+            sk_combined_hex.zeroize();
+
+            let vk: [u8; ML_DSA_65_VK_SIZE] = vk_bytes
+                .try_into()
+                .map_err(|_| "Longitud de llave pública de firma incorrecta")?;
+            let sk: [u8; ML_DSA_65_SK_SIZE] = sk_bytes
+                .try_into()
+                .map_err(|_| "Longitud de llave privada de firma incorrecta")?;
+            Some((vk, sk))
+        } else {
+            None
+        };
+
+    let is_signed = signing_keys.is_some();
+    let output_path_clone = output_path.clone();
+    let input_path_clone = input_path.clone();
+
+    // Bug #2 Fix — ATOMICIDAD DE LA FIRMA:
+    // Todo el proceso (cifrado + hash + firma + sync_all) ocurre dentro de un único
+    // spawn_blocking. El archivo NUNCA se sincroniza al disco con una firma nula:
+    // sync_all() se ejecuta solo DESPUÉS de que la firma haya sido inyectada.
+    tokio::task::spawn_blocking(move || {
+        // Usar HashingWriter para calcular el hash del payload AL VUELO durante el cifrado.
+        // Esto elimina la segunda pasada de lectura del archivo para calcular el hash.
+        let hashing_writer = HashingWriter::new(BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(&output_path_clone)
+                .map_err(|_| "Error al abrir archivo para cifrado atómico".to_string())?,
+        ));
+
+        // Cifrar bloques mientras se acumula el hash del payload cifrado
+        let mut hashing_writer = hashing_writer;
+        
+        if is_folder {
+            let enc_writer = EncryptWriter::new(
+                hashing_writer,
+                aes_cipher,
+                chacha_cipher,
+                aes_nonce_raw,
+                chacha_nonce_raw,
+            );
+            let mut builder = tar::Builder::new(enc_writer);
+            if let Err(e) = builder.append_dir_all(".", &input_path_clone) {
+                return Err(format!("Error al empaquetar carpeta al vuelo: {}", e));
+            }
+            let enc_writer = builder.into_inner().map_err(|_| "Error al finalizar empaquetado TAR".to_string())?;
+            hashing_writer = enc_writer.finish().map_err(|e| e.to_string())?;
+        } else {
+            let mut input_reader = BufReader::new(
+                File::open(&input_path_clone).map_err(|_| "Error al reabrir archivo origen".to_string())?
+            );
+            encrypt_blocks(
+                &mut input_reader,
+                &mut hashing_writer,
+                &aes_cipher,
+                &chacha_cipher,
+                &aes_nonce_raw,
+                &chacha_nonce_raw,
+            )
+            .map_err(|e| e.to_string())?;
         }
-        let file_hash = hasher.finalize();
 
-        let dsa_vk_bytes: [u8; 1952] = vk_bytes
-            .try_into()
-            .map_err(|_| "Longitud de llave pública de firma incorrecta")?;
-        let dsa_sk_bytes: [u8; 4032] = sk_bytes
-            .try_into()
-            .map_err(|_| "Longitud de llave privada de firma incorrecta")?;
+        // Extraer el hash y el inner BufWriter antes de seguir
+        let (buf_writer, payload_hash) = hashing_writer.finalize();
 
-        let dsa_kp = MlDsaKeyPair::from_keys(&dsa_sk_bytes, &dsa_vk_bytes, ML_DSA_65)
-            .map_err(|_| "Error al cargar par de llaves de firma")?;
-        let sig = dsa_kp
-            .sign(file_hash.as_slice(), b"")
-            .map_err(|_| "Error al generar firma digital")?;
+        // Vaciar el buffer al OS (pero NO sync_all todavía)
+        let mut file = buf_writer
+            .into_inner()
+            .map_err(|_| "Error al desempaquetar BufWriter".to_string())?;
+        file.flush()
+            .map_err(|_| "Error al vaciar buffer del payload".to_string())?;
 
-        // Inyección quirúrgica de la firma: SeekFrom::Start(5) = 4 Magic Bytes + 1 Vault ID
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&output_path)
-            .map_err(|_| "Error al inyectar firma")?;
-        f.seek(SeekFrom::Start(5))
-            .map_err(|_| "Error I/O al posicionar para inyección de firma")?;
-        f.write_all(sig.as_bytes())
-            .map_err(|_| "Error al escribir firma en disco")?;
-    }
+        // Inyección Atómica de la Firma (si procede):
+        // Esto ocurre ANTES de sync_all, garantizando que el archivo nunca queda
+        // con firma cero-rellenada en disco en caso de fallo de hardware.
+        if let Some((dsa_vk_bytes, dsa_sk_bytes)) = signing_keys {
+            let dsa_kp = MlDsaKeyPair::from_keys(&dsa_sk_bytes, &dsa_vk_bytes, ML_DSA_65)
+                .map_err(|_| "Error al cargar par de llaves de firma".to_string())?;
+            let sig = dsa_kp
+                .sign(payload_hash.as_slice(), b"")
+                .map_err(|_| "Error al generar firma digital".to_string())?;
+
+            // Seek atómico: 4 (MAGIC_BYTES) + 1 (vault_id) = posición 5
+            file.seek(SeekFrom::Start(5))
+                .map_err(|_| "Error I/O al posicionar para inyección de firma".to_string())?;
+            file.write_all(sig.as_bytes())
+                .map_err(|_| "Error al escribir firma en disco".to_string())?;
+        }
+
+        // sync_all() SOLO DESPUÉS de que la firma esté escrita.
+        // El SO garantiza que todo (payload + firma) llega al dispositivo físico.
+        file.sync_all()
+            .map_err(|_| "Error de I/O al sincronizar disco".to_string())?;
+
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| {
+        let _ = secure_shred(&output_path);
+        "Error de hardware aislando el cifrado cuántico".to_string()
+    })??;
 
     if shred_original {
-        let _ = secure_shred(&input_path);
+        if is_folder {
+            let _ = secure_shred_dir_recursive(std::path::Path::new(&input_path));
+        } else {
+            let _ = secure_shred(&input_path);
+        }
     }
 
     Ok(EncryptResponse {
         success: true,
-        message: "Archivo blindado y firmado con Identidad Cuántica".into(),
+        message: if is_signed {
+            "Carpeta/Archivo blindado y firmado con Identidad Cuántica (firma atómica ML-DSA-65)".into()
+        } else {
+            "Carpeta/Archivo cifrado con Identidad Cuántica (ML-KEM-1024)".into()
+        },
         data: None,
     })
 }
 
 #[tauri::command]
-pub async fn decrypt_with_quantum(
+pub async fn encrypt_with_quantum(
+    input_path: String,
+    output_path: String,
+    public_key_hex: String,
+    signing_key_hex: Option<String>,
+    shred_original: bool,
+) -> Result<EncryptResponse, String> {
+    encrypt_quantum_internal(input_path, output_path, public_key_hex, signing_key_hex, shred_original, false).await
+}
+
+#[tauri::command]
+pub async fn encrypt_folder_with_quantum(
+    input_path: String,
+    output_path: String,
+    public_key_hex: String,
+    signing_key_hex: Option<String>,
+    shred_original: bool,
+) -> Result<EncryptResponse, String> {
+    encrypt_quantum_internal(input_path, output_path, public_key_hex, signing_key_hex, shred_original, true).await
+}
+
+async fn decrypt_quantum_internal(
     input_path: String,
     output_path: String,
     mut private_key_hex: String,
     verifier_key_hex: Option<String>,
+    is_folder: bool,
 ) -> Result<EncryptResponse, String> {
     validate_path(&input_path)?;
     validate_path(&output_path)?;
@@ -679,13 +978,13 @@ pub async fn decrypt_with_quantum(
     // 2. Verificar Firma Digital (Si el contenedor es de tipo 2)
     // Implementa el estándar FIPS 204 (ML-DSA-65).
     if vault_id == 2 {
-        let mut sig = [0u8; 3309]; // Tamaño de firma ML-DSA-65
+        let mut sig = [0u8; ML_DSA_65_SIG_SIZE]; // Tamaño de firma ML-DSA-65
         input_file
             .read_exact(&mut sig)
             .map_err(|_| "Fallo al leer firma digital")?;
-        // NOTA BUG #2: Tras leer 3309 bytes de firma, el cursor está en:
-        //   - Con magic bytes (nuevo): 4 + 1 + 3309 = 3314
-        //   - Sin magic bytes (viejo): 1 + 3309 = 3310
+        // NOTA BUG #2: Tras leer ML_DSA_65_SIG_SIZE bytes de firma, el cursor está en:
+        //   - Con magic bytes (nuevo): 4 + 1 + ML_DSA_65_SIG_SIZE = PAYLOAD_OFFSET_WITH_MAGIC
+        //   - Sin magic bytes (viejo): 1 + ML_DSA_65_SIG_SIZE = PAYLOAD_OFFSET_LEGACY
         // El hash de verificación se calcula leyendo el resto del archivo desde este punto,
         // lo que coincide EXACTAMENTE con el offset desde donde se calculó al firmar.
         // Es crítico que estas posiciones permanezcan sincronizadas entre encrypt y decrypt.
@@ -701,7 +1000,7 @@ pub async fn decrypt_with_quantum(
             let vk_bytes = hex::decode(&vk_hex).map_err(|_| "Llave de verificación inválida")?;
             vk_hex.zeroize(); // Defensa RAM: Destruir llave de verificación
 
-            // El cursor ya está en la posición correcta (3314 o 3310 según versión).
+            // El cursor ya está en la posición correcta (PAYLOAD_OFFSET_WITH_MAGIC o PAYLOAD_OFFSET_LEGACY según versión).
             // Leemos el resto del archivo para calcular el hash del payload protegido.
             let mut hasher = Sha256::new();
             let mut hash_buf = [0u8; 65536];
@@ -716,7 +1015,7 @@ pub async fn decrypt_with_quantum(
             }
             let file_hash = hasher.finalize();
 
-            let vk_bytes_array: [u8; 1952] = vk_bytes
+            let vk_bytes_array: [u8; ML_DSA_65_VK_SIZE] = vk_bytes
                 .try_into()
                 .map_err(|_| "Longitud de llave de verificación incorrecta")?;
             let dsa_sig = dilithium::MlDsaSignature::from_slice(&sig);
@@ -737,7 +1036,7 @@ pub async fn decrypt_with_quantum(
 
             // Reabrir el archivo y posicionar el cursor en el inicio del KEM ciphertext
             // (después de Magic+ID+Firma). Necesario porque el hash consumió el stream.
-            let payload_offset = if has_magic { 3314 } else { 3310 };
+            let payload_offset = if has_magic { PAYLOAD_OFFSET_WITH_MAGIC } else { PAYLOAD_OFFSET_LEGACY };
             input_file =
                 File::open(&input_path).map_err(|_| "Fallo al reabrir archivo para descifrado")?;
             input_file
@@ -745,7 +1044,7 @@ pub async fn decrypt_with_quantum(
                 .map_err(|_| "Fallo al posicionar cursor para KEM")?;
         } else {
             // Sin llave de verificación: saltar directamente al inicio del KEM ciphertext
-            let payload_offset = if has_magic { 3314 } else { 3310 };
+            let payload_offset = if has_magic { PAYLOAD_OFFSET_WITH_MAGIC } else { PAYLOAD_OFFSET_LEGACY };
             input_file
                 .seek(SeekFrom::Start(payload_offset))
                 .map_err(|_| "Fallo al posicionar cursor para KEM")?;
@@ -753,7 +1052,7 @@ pub async fn decrypt_with_quantum(
     }
 
     // Leer Ciphertext de ML-KEM
-    let mut kem_ciphertext = vec![0u8; 1568]; // Tamaño fijo para ML-KEM-1024
+    let mut kem_ciphertext = vec![0u8; ML_KEM_1024_CT_SIZE]; // Tamaño fijo para ML-KEM-1024
     input_file
         .read_exact(&mut kem_ciphertext)
         .map_err(|_| "Error al leer cifrado KEM")?;
@@ -781,7 +1080,7 @@ pub async fn decrypt_with_quantum(
     let sk = DecapsulationKey::<MlKem1024Params>::from_bytes(sk_bytes_array.into());
 
     // Convertir el ciphertext en el tipo esperado por kem
-    let ct_bytes_array: [u8; 1568] = kem_ciphertext
+    let ct_bytes_array: [u8; ML_KEM_1024_CT_SIZE] = kem_ciphertext
         .try_into()
         .map_err(|_| "Contenedor cuántico corrupto")?;
     let ciphertext = ml_kem::array::Array::from(ct_bytes_array);
@@ -794,8 +1093,6 @@ pub async fn decrypt_with_quantum(
 
     // Ahora procedemos con el descifrado normal usando ese secreto
     // FIX #1: Sanitización de errores de I/O — sin filtrar rutas del SO al frontend
-    let mut output_file =
-        File::create(&output_path).map_err(|_| "Error al crear el archivo de destino.")?;
 
     let mut salt = [0u8; SALT_SIZE];
     let mut aes_nonce_raw = [0u8; NONCE_SIZE];
@@ -820,149 +1117,60 @@ pub async fn decrypt_with_quantum(
 
     let mut reader = BufReader::new(input_file);
     let output_path_clone = output_path.clone();
+    let output_path_err = output_path.clone();
+
     tokio::task::spawn_blocking(move || {
-        decrypt_blocks(
-            &mut reader,
-            &mut output_file,
-            &aes_cipher,
-            &chacha_cipher,
-            &aes_nonce_raw,
-            &chacha_nonce_raw,
-            use_compression,
-        )
+        if is_folder {
+            let dec_reader = DecryptReader::new(
+                reader,
+                aes_cipher,
+                chacha_cipher,
+                aes_nonce_raw,
+                chacha_nonce_raw,
+                use_compression,
+            );
+            let mut archive = tar::Archive::new(dec_reader);
+            if let Err(e) = archive.unpack(&output_path_clone) {
+                return Err(format!("Error al extraer carpeta al vuelo: {}", e));
+            }
+        } else {
+            let output_file = File::create(&output_path_clone).map_err(|_| "Error al crear el archivo de destino.".to_string())?;
+            let mut writer = BufWriter::new(output_file);
+            decrypt_blocks(
+                &mut reader,
+                &mut writer,
+                &aes_cipher,
+                &chacha_cipher,
+                &aes_nonce_raw,
+                &chacha_nonce_raw,
+                use_compression,
+            )?;
+            writer.flush().map_err(|_| "Error de I/O al vaciar los datos descifrados al disco".to_string())?;
+        }
+        Ok::<(), String>(())
     }).await.map_err(|_| "Error de hardware aislando el descifrado cuántico".to_string())?.map_err(|e| {
         // Prevención de Unauthenticated Plaintext Release: Destruir archivo parcial en caso de error
-        let _ = secure_shred(&output_path_clone);
+        let _ = secure_shred(&output_path_err);
         e
     })?;
 
     Ok(EncryptResponse {
         success: true,
-        message: "Archivo descifrado con éxito mediante Identidad Cuántica".into(),
+        message: "Carpeta/Archivo descifrado con éxito mediante Identidad Cuántica".into(),
         data: None,
     })
 }
-/// Comando para cifrar una carpeta completa empaquetándola en un contenedor .vault
+
 #[tauri::command]
-pub async fn encrypt_folder(
+pub async fn decrypt_with_quantum(
     input_path: String,
     output_path: String,
-    password: String,
-    shred_original: bool,
+    private_key_hex: String,
+    verifier_key_hex: Option<String>,
 ) -> Result<EncryptResponse, String> {
-    // FIX #4: Sufijo aleatorio anti-TOCTOU — evita que un atacante prediga la ruta del temporal
-    let mut suffix_bytes = [0u8; 4];
-    OsRng.fill_bytes(&mut suffix_bytes);
-    let temp_tar = format!("{}.tmp_{}", output_path, hex::encode(suffix_bytes));
-
-    // Crear el archivo TAR temporal
-    {
-        let file = File::create(&temp_tar).map_err(|_| "Error al crear archivo temporal")?;
-        let mut builder = tar::Builder::new(file);
-        builder
-            .append_dir_all(".", &input_path)
-            .map_err(|_| "Error al empaquetar carpeta")?;
-        builder
-            .finish()
-            .map_err(|_| "Error al finalizar empaquetado")?;
-    }
-
-    // Cifrar el archivo TAR temporal
-    let result = encrypt_file(temp_tar.clone(), output_path, password, false).await;
-    let _ = secure_shred(&temp_tar);
-
-    if result.as_ref().is_ok() && shred_original {
-        // Borrado seguro (DoD 5220.22-M) recursivo de la carpeta
-        let _ = secure_shred_dir_recursive(std::path::Path::new(&input_path));
-    }
-
-    result
+    decrypt_quantum_internal(input_path, output_path, private_key_hex, verifier_key_hex, false).await
 }
 
-/// Comando para descifrar un contenedor y extraer la carpeta original
-#[tauri::command]
-pub async fn decrypt_folder(
-    input_path: String,
-    output_path: String,
-    password: String,
-) -> Result<EncryptResponse, String> {
-    // FIX #4: Sufijo aleatorio anti-TOCTOU
-    let mut suffix_bytes = [0u8; 4];
-    OsRng.fill_bytes(&mut suffix_bytes);
-    let temp_tar = format!("{}.tmp_{}", input_path, hex::encode(suffix_bytes));
-
-    // Descifrar el contenedor al archivo TAR temporal
-    let result = decrypt_file(input_path, temp_tar.clone(), password).await.map_err(|e| {
-        let _ = secure_shred(&temp_tar);
-        e
-    })?;
-
-    if result.success {
-        // FIX #3: Capturar error de unpack para limpiar el temporal antes de propagar
-        let file = File::open(&temp_tar).map_err(|_| "Error al abrir TAR temporal")?;
-        let mut archive = tar::Archive::new(file);
-        let unpack_result = archive.unpack(&output_path);
-        let _ = secure_shred(&temp_tar); // Siempre limpiar, haya o no error
-        unpack_result.map_err(|_| "Error al extraer la carpeta del contenedor")?;
-
-        Ok(EncryptResponse {
-            success: true,
-            message: "Carpeta restaurada con éxito desde el contenedor seguro".into(),
-            data: None,
-        })
-    } else {
-        let _ = secure_shred(&temp_tar);
-        Err("Fallo al descifrar el contenedor de la carpeta".into())
-    }
-}
-
-/// Comando para cifrar una carpeta completa con Identidad Cuántica
-#[tauri::command]
-pub async fn encrypt_folder_with_quantum(
-    input_path: String,
-    output_path: String,
-    public_key_hex: String,
-    signing_key_hex: Option<String>,
-    shred_original: bool,
-) -> Result<EncryptResponse, String> {
-    // FIX #4: Sufijo aleatorio anti-TOCTOU
-    let mut suffix_bytes = [0u8; 4];
-    OsRng.fill_bytes(&mut suffix_bytes);
-    let temp_tar = format!("{}.tmp_{}", output_path, hex::encode(suffix_bytes));
-
-    // 1. Crear TAR temporal
-    {
-        let file = File::create(&temp_tar).map_err(|_| "Error al crear archivo temporal")?;
-        let mut builder = tar::Builder::new(file);
-        builder
-            .append_dir_all(".", &input_path)
-            .map_err(|_| "Error al empaquetar carpeta")?;
-        builder
-            .finish()
-            .map_err(|_| "Error al finalizar empaquetado")?;
-    }
-
-    // 2. Cifrar con PQC — capturar Result para garantizar limpieza del temporal
-    let result = encrypt_with_quantum(
-        temp_tar.clone(),
-        output_path,
-        public_key_hex,
-        signing_key_hex,
-        false,
-    )
-    .await;
-    let _ = secure_shred(&temp_tar); // Siempre limpiar el temporal
-    let result = result?;
-
-    // Borrado seguro (DoD 5220.22-M) recursivo verdadero
-    if result.success && shred_original {
-        let _ = secure_shred_dir_recursive(std::path::Path::new(&input_path));
-    }
-
-    Ok(result)
-}
-
-/// Comando para descifrar una carpeta con Identidad Cuántica
 #[tauri::command]
 pub async fn decrypt_folder_with_quantum(
     input_path: String,
@@ -970,41 +1178,149 @@ pub async fn decrypt_folder_with_quantum(
     private_key_hex: String,
     verifier_key_hex: Option<String>,
 ) -> Result<EncryptResponse, String> {
-    // FIX #4: Sufijo aleatorio anti-TOCTOU
-    let mut suffix_bytes = [0u8; 4];
-    OsRng.fill_bytes(&mut suffix_bytes);
-    let temp_tar = format!("{}.tmp_{}", input_path, hex::encode(suffix_bytes));
+    decrypt_quantum_internal(input_path, output_path, private_key_hex, verifier_key_hex, true).await
+}
 
-    // Descifrar con PQC — capturar Result para limpiar temporal si falla
-    let result = decrypt_with_quantum(
-        input_path,
-        temp_tar.clone(),
-        private_key_hex,
-        verifier_key_hex,
-    )
-    .await
-    .map_err(|e| {
-        let _ = secure_shred(&temp_tar);
+/// Comando para cifrar una carpeta completa empaquetándola en un contenedor .vault al vuelo
+#[tauri::command]
+pub async fn encrypt_folder(
+    input_path: String,
+    output_path: String,
+    mut password: String,
+    shred_original: bool,
+) -> Result<EncryptResponse, String> {
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
+
+    let output_file = File::create(&output_path).map_err(|_| "Error al crear el archivo de destino.")?;
+    let mut output_file = BufWriter::new(output_file);
+
+    let mut salt = [0u8; SALT_SIZE];
+    let mut aes_nonce_raw = [0u8; NONCE_SIZE];
+    let mut chacha_nonce_raw = [0u8; NONCE_SIZE];
+
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut aes_nonce_raw);
+    OsRng.fill_bytes(&mut chacha_nonce_raw);
+
+    output_file.write_all(MAGIC_BYTES).map_err(|_| "Fallo de I/O al escribir Magic Bytes")?;
+    let flags = 0x00u8; // Compresión desactivada
+    output_file.write_all(&[flags]).map_err(|_| "Fallo de I/O al escribir Flags")?;
+    output_file.write_all(&salt).map_err(|_| "Fallo de I/O al escribir Salt")?;
+    output_file.write_all(&aes_nonce_raw).map_err(|_| "Fallo de I/O al escribir Nonce AES")?;
+    output_file.write_all(&chacha_nonce_raw).map_err(|_| "Fallo de I/O al escribir Nonce ChaCha")?;
+
+    let (aes_key, chacha_key) = derive_keys(&password, &salt)?;
+    password.zeroize();
+
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error al inicializar cifrador AES")?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|_| "Error al inicializar cifrador ChaCha20")?;
+
+    let input_path_clone = input_path.clone();
+    let output_path_clone = output_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let enc_writer = EncryptWriter::new(
+            output_file,
+            aes_cipher,
+            chacha_cipher,
+            aes_nonce_raw,
+            chacha_nonce_raw,
+        );
+        
+        let mut builder = tar::Builder::new(enc_writer);
+        if let Err(e) = builder.append_dir_all(".", &input_path_clone) {
+            return Err(format!("Error al empaquetar carpeta al vuelo: {}", e));
+        }
+        
+        let enc_writer = builder.into_inner().map_err(|_| "Error al finalizar empaquetado TAR".to_string())?;
+        let mut inner_writer = enc_writer.finish().map_err(|e| e.to_string())?;
+        inner_writer.flush().map_err(|_| "Error al vaciar disco".to_string())?;
+        
+        Ok::<(), String>(())
+    }).await.map_err(|_| "Error de hardware aislando cifrado de carpeta".to_string())?.map_err(|e| {
+        let _ = secure_shred(&output_path_clone);
         e
     })?;
 
-    if result.success {
-        let file = File::open(&temp_tar).map_err(|_| "Error al abrir TAR temporal")?;
-        let mut archive = tar::Archive::new(file);
-        let unpack_result = archive.unpack(&output_path);
-        let _ = secure_shred(&temp_tar); // Limpiar siempre
-        unpack_result.map_err(|_| "Error al extraer carpeta del contenedor")?;
-
-        Ok(EncryptResponse {
-            success: true,
-            message: "Carpeta restaurada con éxito mediante identidad cuántica".into(),
-            data: None,
-        })
-    } else {
-        let _ = secure_shred(&temp_tar);
-        Err("Fallo al descifrar el contenedor cuántico de la carpeta".into())
+    if shred_original {
+        let _ = secure_shred_dir_recursive(std::path::Path::new(&input_path));
     }
+
+    Ok(EncryptResponse {
+        success: true,
+        message: "Carpeta blindada con éxito (Streaming Encryptor Sin Archivos Temporales)".into(),
+        data: None,
+    })
 }
+
+/// Comando para descifrar un contenedor y extraer la carpeta original al vuelo
+#[tauri::command]
+pub async fn decrypt_folder(
+    input_path: String,
+    output_path: String,
+    mut password: String,
+) -> Result<EncryptResponse, String> {
+    validate_path(&input_path)?;
+    validate_path(&output_path)?;
+
+    let mut input_file = File::open(&input_path).map_err(|_| "Error al leer el contenedor.")?;
+
+    let mut magic_buf = [0u8; 4];
+    if input_file.read_exact(&mut magic_buf).is_ok() && &magic_buf != MAGIC_BYTES {
+        input_file.seek(SeekFrom::Start(0)).map_err(|_| "Error interno")?;
+    } else if &magic_buf != MAGIC_BYTES {
+        return Err("Contenedor corrupto.".into());
+    }
+
+    let mut flags_buf = [0u8; 1];
+    input_file.read_exact(&mut flags_buf).map_err(|_| "Archivo corrupto: faltan banderas")?;
+    let flags = flags_buf[0];
+
+    let mut salt = [0u8; SALT_SIZE];
+    let mut aes_nonce_raw = [0u8; NONCE_SIZE];
+    let mut chacha_nonce_raw = [0u8; NONCE_SIZE];
+
+    input_file.read_exact(&mut salt).map_err(|_| "Archivo corrupto: falta salt")?;
+    input_file.read_exact(&mut aes_nonce_raw).map_err(|_| "Archivo corrupto: falta nonce AES")?;
+    input_file.read_exact(&mut chacha_nonce_raw).map_err(|_| "Archivo corrupto: falta nonce ChaCha")?;
+
+    let input_file = BufReader::new(input_file);
+
+    let (aes_key, chacha_key) = derive_keys(&password, &salt)?;
+    password.zeroize();
+
+    let aes_cipher = Aes256Gcm::new_from_slice(aes_key.as_slice()).map_err(|_| "Error al inicializar cifrador AES")?;
+    let chacha_cipher = ChaCha20Poly1305::new_from_slice(chacha_key.as_slice()).map_err(|_| "Error al inicializar cifrador ChaCha20")?;
+    let use_compression = (flags & 0x01) != 0;
+
+    let output_path_clone = output_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let dec_reader = DecryptReader::new(
+            input_file,
+            aes_cipher,
+            chacha_cipher,
+            aes_nonce_raw,
+            chacha_nonce_raw,
+            use_compression,
+        );
+
+        let mut archive = tar::Archive::new(dec_reader);
+        if let Err(e) = archive.unpack(&output_path_clone) {
+            return Err(format!("Error al extraer carpeta al vuelo: {}", e));
+        }
+
+        Ok::<(), String>(())
+    }).await.map_err(|_| "Error de hardware aislando descifrado de carpeta".to_string())??;
+
+    Ok(EncryptResponse {
+        success: true,
+        message: "Carpeta restaurada con éxito (Streaming Decryptor)".into(),
+        data: None,
+    })
+}
+
 
 /// Comando para ocultar un archivo .vault dentro de cualquier archivo (Imagen, Video, Audio)
 #[tauri::command]
@@ -1066,13 +1382,16 @@ pub async fn extract_from_image(
     let mut found_pos = None;
     let mut current_offset = 0u64;
 
+    // OPTIMIZACIÓN MEMORIA: Pre-asignar vector de búsqueda para reciclar memoria
+    let mut search_buf = Vec::with_capacity(CHUNK_SIZE + marker_len);
+
     loop {
         let count = file.read(&mut buffer).map_err(|_| "Error de I/O al leer el archivo.")?;
         if count == 0 {
             break;
         }
 
-        let mut search_buf = Vec::with_capacity(previous_tail.len() + count);
+        search_buf.clear();
         search_buf.extend_from_slice(&previous_tail);
         search_buf.extend_from_slice(&buffer[..count]);
 
@@ -1095,8 +1414,10 @@ pub async fn extract_from_image(
 
     if let Some(pos) = found_pos {
         file.seek(SeekFrom::Start(pos)).map_err(|_| "Error de I/O al posicionar el cursor.")?;
-        let mut out_file = File::create(&output_vault_path).map_err(|_| "Error al crear el archivo extraído.")?;
-        io::copy(&mut file, &mut out_file).map_err(|_| "Error de I/O al volcar los datos extraídos.")?;
+        let out_file = File::create(&output_vault_path).map_err(|_| "Error al crear el archivo extraído.")?;
+        let mut out_writer = std::io::BufWriter::new(out_file);
+        io::copy(&mut file, &mut out_writer).map_err(|_| "Error de I/O al volcar los datos extraídos.")?;
+        out_writer.flush().map_err(|_| "Error de I/O al vaciar el búfer del archivo extraído al disco")?;
 
         Ok(EncryptResponse {
             success: true,

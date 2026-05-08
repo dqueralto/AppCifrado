@@ -60,5 +60,5 @@ pub fn run() {
             delete_contact
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("Error crítico al ejecutar la aplicación Tauri");
 }
