@@ -94,19 +94,39 @@ export default function App() {
     };
   }, [isAppUnlocked]);
 
+  // Seguridad: Limpieza reactiva total de memoria al bloquearse la aplicación (Zeroize global)
+  // Evita que llaves privadas, contraseñas o contactos descifrados persistan en el estado React.
+  useEffect(() => {
+    if (!isAppUnlocked) {
+      setContacts([]);
+      setIdentity(null);
+      setPassword("");
+      setContactsPassword("");
+      setQuantumKey("");
+      setVerifierKey("");
+      setCarrierPath("");
+      setInputPath("");
+    }
+  }, [isAppUnlocked]);
+
   const closeContacts = () => {
     setShowContacts(false);
-    setContacts([]);
+    // No borramos los contactos del estado para evitar re-derivar Argon2
+    // al volver a abrir el modal. Se refrescan al añadir/eliminar.
   };
 
   /**
    * Carga la lista de contactos desde el almacenamiento cifrado.
-   * Requiere la contraseña maestra para derivar la llave de descifrado AES.
+   * Solo se ejecuta si no hay contactos cacheados o si se fuerza la recarga.
    */
   const loadContacts = async (pass?: string) => {
     const p = pass || contactsPassword;
     if (!p) {
       toast.error("Introduce la contraseña de la libreta");
+      return;
+    }
+    // Si ya tenemos contactos cacheados, no re-derivar Argon2
+    if (contacts.length > 0) {
       return;
     }
     setIsLoadingContacts(true);
@@ -122,41 +142,62 @@ export default function App() {
   };
 
   /**
+   * Fuerza la recarga de contactos (ignora el cache).
+   * Se usa después de la primera autenticación.
+   */
+  const forceLoadContacts = async (pass: string) => {
+    setIsLoadingContacts(true);
+    try {
+      const list: any = await invoke("get_contacts", { password: pass });
+      setContacts(list);
+    } catch (err) {
+      toast.error(String(err));
+      setContacts([]);
+    } finally {
+      setIsLoadingContacts(false);
+    }
+  };
+
+  /**
    * Añade un nuevo contacto a la libreta cifrada.
-   * Realiza un Zeroize implícito de la contraseña tras la operación en el backend.
+   * El backend devuelve la lista actualizada directamente, eliminando
+   * la necesidad de una segunda llamada a get_contacts (ahorro de 1 derivación Argon2).
    */
   const handleAddContact = async (contact: { name: string; key: string; verifierKey: string }) => {
     if (!contact.name || !contact.key || !contactsPassword || isLoadingContacts) return false;
     setIsLoadingContacts(true);
     try {
-      await invoke("save_contact", {
+      const updatedList: any = await invoke("save_contact", {
         password: contactsPassword,
         name: contact.name,
         publicKey: contact.key,
         verifierKey: contact.verifierKey || ""
       });
-      await loadContacts(contactsPassword);
+      setContacts(updatedList); // Usa la lista devuelta sin re-fetch
       toast.success("Contacto guardado de forma segura");
       return true;
     } catch (err) {
       toast.error(String(err));
-      setIsLoadingContacts(false);
       return false;
+    } finally {
+      setIsLoadingContacts(false);
     }
   };
 
   /**
    * Elimina un contacto por su nombre único.
+   * El backend devuelve la lista actualizada directamente.
    */
   const handleDeleteContact = async (name: string) => {
     if (isLoadingContacts) return;
     setIsLoadingContacts(true);
     try {
-      await invoke("delete_contact", { password: contactsPassword, name });
-      await loadContacts(contactsPassword);
+      const updatedList: any = await invoke("delete_contact", { password: contactsPassword, name });
+      setContacts(updatedList); // Usa la lista devuelta sin re-fetch
       toast.success("Contacto eliminado");
     } catch (err) {
       toast.error(String(err));
+    } finally {
       setIsLoadingContacts(false);
     }
   };
@@ -429,7 +470,8 @@ export default function App() {
   const handleGatekeeperUnlock = async () => {
     if (!contactsPassword) return;
     try {
-      await invoke("get_contacts", { password: contactsPassword });
+      // Cargamos los contactos inmediatamente usando forceLoadContacts para cachearlos
+      await forceLoadContacts(contactsPassword);
       setIsAppUnlocked(true);
       setShowGatekeeper(false);
       toast.success("Bóveda desbloqueada");

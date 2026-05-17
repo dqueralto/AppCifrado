@@ -10,6 +10,9 @@
     "opener:default",
     "dialog:default",
     "clipboard-manager:default",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "fs:default",
+    "fs:allow-read-file",
+    "fs:allow-write-file"
   ]
 }

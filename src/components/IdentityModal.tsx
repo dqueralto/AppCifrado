@@ -1,19 +1,20 @@
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask, save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import {
   XCircle,
   Fingerprint,
   Info,
   ShieldAlert,
   CheckCircle2,
+  QrCode,
+  Download,
 } from "lucide-react";
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
-import { Identity } from "../types";
-
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
+import { cn } from "../utils";
+import { toast } from "../toast";
+import { Identity, ContactExportFile } from "../types";
+import { QRCodeDisplay } from "./QRCodeDisplay";
 
 interface IdentityModalProps {
   show: boolean;
@@ -36,6 +37,8 @@ export function IdentityModal({
   onRegenerate,
   onDelete,
 }: IdentityModalProps) {
+  const [showShareQR, setShowShareQR] = useState(false);
+
   if (!identity) return null;
 
   const handleCopyAll = () => {
@@ -75,6 +78,32 @@ ${identity.dsa_priv}
     if (ok) onDelete();
   };
 
+  // Exportar tus llaves PÚBLICAS como archivo .cbrokey para compartir
+  const handleExportPublicKeys = async () => {
+    const outputPath = await save({
+      title: "Exportar tu identidad pública",
+      defaultPath: "Mi_Identidad_CryptoBro.cbrokey",
+      filters: [{ name: "Identidad CryptoBro", extensions: ["cbrokey"] }],
+    });
+    if (!outputPath) return;
+
+    const exportData: ContactExportFile = {
+      app: "CryptoBro",
+      v: 1,
+      name: "Mi Identidad",
+      kem_pub: identity.kem_pub,
+      dsa_pub: identity.dsa_pub,
+    };
+
+    try {
+      const json = JSON.stringify(exportData, null, 2);
+      await writeFile(outputPath, new TextEncoder().encode(json));
+      toast.success("Identidad pública exportada como .cbrokey");
+    } catch (err) {
+      toast.error("Error al exportar: " + String(err));
+    }
+  };
+
   return (
     <AnimatePresence>
       {show && (
@@ -112,13 +141,11 @@ ${identity.dsa_priv}
               </div>
 
               {/* Acordeón de Guía de Uso */}
-              <AnimatePresence>
-                {showKeyGuide && (
+              {showKeyGuide && (
                   <motion.div
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: 'auto', opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    className="overflow-hidden"
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.2 }}
                   >
                     <div className="bg-brand-cyan/5 border border-brand-cyan/20 rounded-2xl p-5 space-y-4 text-[10px] leading-relaxed text-white/70">
                       <p className="font-bold text-brand-cyan uppercase tracking-widest text-[9px]">Protocolo de Uso de Llaves:</p>
@@ -142,8 +169,71 @@ ${identity.dsa_priv}
                       </div>
                     </div>
                   </motion.div>
+              )}
+
+              {/* ============================================ */}
+              {/* SECCIÓN: COMPARTIR TU IDENTIDAD (QR Codes) */}
+              {/* ============================================ */}
+              <div className="space-y-3">
+                <button
+                  onClick={() => setShowShareQR(!showShareQR)}
+                  className={cn(
+                    "w-full flex items-center gap-3 p-4 rounded-2xl border transition-all",
+                    showShareQR
+                      ? "bg-brand-violet/10 border-brand-violet/30"
+                      : "bg-white/[0.02] border-white/10 hover:border-brand-violet/20"
+                  )}
+                >
+                  <div className={cn(
+                    "p-2 rounded-xl transition-colors",
+                    showShareQR ? "bg-brand-violet/20 text-brand-violet" : "bg-white/5 text-white/30"
+                  )}>
+                    <QrCode className="w-5 h-5" />
+                  </div>
+                  <div className="text-left flex-1">
+                    <p className="text-xs font-bold text-white/80">Compartir tu Identidad Pública</p>
+                    <p className="text-[9px] text-white/30">Muestra QR codes para que otros te añadan como contacto</p>
+                  </div>
+                </button>
+
+                {showShareQR && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.2 }}
+                    >
+                      <div className="space-y-4 pt-2">
+                        {/* QR Codes de tus llaves públicas */}
+                        <div className="grid grid-cols-2 gap-4">
+                          <QRCodeDisplay
+                            name="Mi Identidad"
+                            keyHex={identity.kem_pub}
+                            type="kem"
+                            size={140}
+                          />
+                          <QRCodeDisplay
+                            name="Mi Identidad"
+                            keyHex={identity.dsa_pub}
+                            type="dsa"
+                            size={140}
+                          />
+                        </div>
+
+                        {/* Botón exportar .cbrokey */}
+                        <button
+                          onClick={handleExportPublicKeys}
+                          className="w-full py-2.5 bg-brand-violet/10 border border-brand-violet/20 rounded-xl text-[10px] font-bold uppercase tracking-widest text-brand-violet hover:bg-brand-violet/20 transition-all flex items-center justify-center gap-2"
+                        >
+                          <Download className="w-3.5 h-3.5" /> Exportar como .cbrokey
+                        </button>
+
+                        <p className="text-[9px] text-white/20 text-center italic">
+                          Solo se exportan las llaves públicas. Tus llaves privadas nunca salen de tu dispositivo.
+                        </p>
+                      </div>
+                    </motion.div>
                 )}
-              </AnimatePresence>
+              </div>
 
               {/* Rejilla de Llaves (KEM y DSA) */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

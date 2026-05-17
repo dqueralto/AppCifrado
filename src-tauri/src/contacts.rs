@@ -94,14 +94,12 @@ fn derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
     key
 }
 
-#[tauri::command]
-pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Contact>, String> {
-    let path = get_contacts_path(&app)?;
+/// Lee y descifra los contactos del disco. Función interna que devuelve los
+/// contactos junto con los parámetros de cifrado para reutilización.
+fn load_contacts_internal(path: &PathBuf, password: &str) -> Result<Vec<Contact>, String> {
     if !path.exists() {
         return Ok(vec![]);
     }
-
-    let pass = password.ok_or("Se requiere contraseña maestra para abrir la libreta")?;
 
     // Verificar si está bloqueado antes de intentar
     {
@@ -127,13 +125,12 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
     let nonce_bytes = hex::decode(store.nonce).map_err(|_| "Error interno: Nonce corrupto en la bóveda de contactos")?;
     let encrypted_data = hex::decode(store.data).map_err(|_| "Error interno: Datos cifrados corruptos")?;
 
-    let key_bytes = derive_key(&pass, &salt);
+    let key_bytes = derive_key(password, &salt);
     let cipher = Aes256Gcm::new_from_slice(key_bytes.as_ref()).map_err(|_| "Error al inicializar el motor de descifrado")?;
 
     let decrypted = cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), encrypted_data.as_slice())
         .map_err(|_| {
-            // Registrar intento fallido
             let _ = check_and_register_attempt("contacts", false);
             "Contraseña de contactos incorrecta"
         })?;
@@ -145,10 +142,10 @@ pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Cont
     Ok(contacts)
 }
 
+/// Cifra y guarda los contactos en disco con salt y nonce nuevos.
 fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> Result<(), String> {
     let mut salt = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
-    // FIX #2 (complemento): Usar OsRng en lugar de thread_rng para consistencia criptográfica
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce_bytes);
 
@@ -173,35 +170,44 @@ fn encrypt_and_save(path: PathBuf, password: &str, contacts: &Vec<Contact>) -> R
 }
 
 #[tauri::command]
+pub fn get_contacts(app: AppHandle, password: Option<String>) -> Result<Vec<Contact>, String> {
+    let path = get_contacts_path(&app)?;
+    let pass = password.ok_or("Se requiere contraseña maestra para abrir la libreta")?;
+    load_contacts_internal(&path, &pass)
+}
+
+/// Guarda un contacto y devuelve la lista actualizada para evitar
+/// que el frontend tenga que llamar a get_contacts de nuevo (ahorra 1 derivación Argon2).
+#[tauri::command]
 pub fn save_contact(
     app: AppHandle,
     mut password: String,
     name: String,
     public_key: String,
     verifier_key: String,
-) -> Result<(), String> {
+) -> Result<Vec<Contact>, String> {
     let path = get_contacts_path(&app)?;
 
-    let mut contacts = if path.exists() {
-        get_contacts(app.clone(), Some(password.clone()))?
-    } else {
-        vec![]
-    };
+    let mut contacts = load_contacts_internal(&path, &password)?;
 
     contacts.retain(|c| c.name != name);
     contacts.push(Contact { name, public_key, verifier_key });
 
-    let result = encrypt_and_save(path, &password, &contacts);
-    password.zeroize(); // Defensa RAM: Destruir contraseña de la libreta
-    result
+    encrypt_and_save(path, &password, &contacts)?;
+    let result = contacts.clone();
+    password.zeroize();
+    Ok(result)
 }
 
+/// Elimina un contacto y devuelve la lista actualizada para evitar
+/// que el frontend tenga que llamar a get_contacts de nuevo (ahorra 1 derivación Argon2).
 #[tauri::command]
-pub fn delete_contact(app: AppHandle, mut password: String, name: String) -> Result<(), String> {
+pub fn delete_contact(app: AppHandle, mut password: String, name: String) -> Result<Vec<Contact>, String> {
     let path = get_contacts_path(&app)?;
-    let mut contacts = get_contacts(app.clone(), Some(password.clone()))?;
+    let mut contacts = load_contacts_internal(&path, &password)?;
     contacts.retain(|c| c.name != name);
-    let result = encrypt_and_save(path, &password, &contacts);
-    password.zeroize(); // Defensa RAM: Destruir contraseña de la libreta
-    result
+    encrypt_and_save(path, &password, &contacts)?;
+    let result = contacts.clone();
+    password.zeroize();
+    Ok(result)
 }
